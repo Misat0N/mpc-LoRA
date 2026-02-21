@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 
 import datasets
@@ -60,9 +61,6 @@ check_min_version("4.42.0.dev0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/text-classification/requirements.txt")
 
-
-print("ext!")
-
 task_to_keys = {
     "cola": ("sentence", None),
     "mnli": ("premise", "hypothesis"),
@@ -74,6 +72,65 @@ task_to_keys = {
     "stsb": ("sentence1", "sentence2"),
     "wnli": ("sentence1", "sentence2"),
 }
+
+logger = logging.getLogger(__name__)
+
+
+def _get_rank():
+    try:
+        return ct.communicator.get().get_rank()
+    except Exception:
+        return -1
+
+
+def _shape_of(tensor):
+    try:
+        return tuple(tensor.size())
+    except Exception:
+        return "unknown"
+
+
+def _cfg_snapshot():
+    snapshot = {}
+    try:
+        snapshot["top_level_keys"] = list(cfg.config.keys())
+    except Exception as err:
+        snapshot["top_level_keys"] = f"<error: {type(err).__name__}: {err}>"
+
+    for section in ("encoder", "debug", "cost", "mpc"):
+        try:
+            snapshot[f"has_{section}"] = hasattr(cfg, section)
+        except Exception as err:
+            snapshot[f"has_{section}"] = f"<error: {type(err).__name__}: {err}>"
+
+    try:
+        snapshot["precision_bits"] = cfg.encoder.precision_bits
+    except Exception as err:
+        snapshot["precision_bits"] = f"<error: {type(err).__name__}: {err}>"
+
+    try:
+        snapshot["validation_mode"] = cfg.debug.validation_mode
+    except Exception as err:
+        snapshot["validation_mode"] = f"<error: {type(err).__name__}: {err}>"
+
+    return snapshot
+
+
+def _loss_snapshot(loss_tensor):
+    snapshot = {
+        "loss_type": type(loss_tensor).__name__,
+        "loss_shape": _shape_of(loss_tensor),
+        "python_recursion_limit": sys.getrecursionlimit(),
+    }
+    try:
+        snapshot["grad_fn"] = type(loss_tensor.grad_fn).__name__ if loss_tensor.grad_fn is not None else None
+    except Exception as err:
+        snapshot["grad_fn"] = f"<error: {type(err).__name__}: {err}>"
+    try:
+        snapshot["children_len"] = len(loss_tensor.children)
+    except Exception as err:
+        snapshot["children_len"] = f"<error: {type(err).__name__}: {err}>"
+    return snapshot
 
 
 def parse_args():
@@ -199,12 +256,15 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+    logger.info("train-smoke start pid=%s argv=%s", os.getpid(), " ".join(sys.argv))
+    logger.info("initial cfg snapshot=%s", _cfg_snapshot())
 
 
     datasets.utils.logging.set_verbosity_warning()
     transformers.utils.logging.set_verbosity_info()
     
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.output_dir is not None:
+        os.makedirs(args.output_dir, exist_ok=True)
 
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
@@ -369,9 +429,11 @@ def main():
         metric = evaluate.load("accuracy")
 
     device = "cuda"
+    logger.info("[rank %s] before ct.init initialized=%s", _get_rank(), ct.is_initialized())
     ct.init()
-    print(hasattr(cfg, "encoder"))
-    print(cfg.encoder.precision_bits)
+    rank = _get_rank()
+    logger.info("[rank %s] crypten initialized=%s", rank, ct.is_initialized())
+    logger.info("[rank %s] cfg after crypten init=%s", rank, _cfg_snapshot())
     # print("done")
     # exit()
     dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
@@ -431,26 +493,44 @@ def main():
     model.eval()
     samples_seen = 0
     start_time_infer = time.time()
+    max_steps = 5
+    logger.info("[rank %s] entering train-smoke loop max_steps=%s", rank, max_steps)
     for step, batch in enumerate(eval_dataloader):
-        print("eval!!!")
+        rank = _get_rank()
+        logger.info(
+            "[rank %s] step=%03d batch_keys=%s input_shape=%s label_shape=%s",
+            rank,
+            step,
+            sorted(batch.keys()),
+            _shape_of(batch["input_ids"]),
+            _shape_of(batch["labels"]),
+        )
         # --- USER MOD: training smoke test (no LoRA) ---
         # keep batch/seq small via args (or by trimming dataset) for quick check
-        max_steps = 5
         if step >= max_steps:
+            logger.info("[rank %s] step=%03d reached max_steps=%s; stop", rank, step, max_steps)
             break
-        print("1.1!")
     
         # if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
         #     continue
-        print("1.2!")
+        if "token_type_ids" not in batch:
+            logger.error("[rank %s] token_type_ids missing in batch. keys=%s", rank, sorted(batch.keys()))
+            raise KeyError("token_type_ids")
         inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
         attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
         token_type_enc = ct.cryptensor(batch["token_type_ids"]).to(device)
 
         # forward (NO ct.no_grad for training)
         # 在不设置ct.no_grad时自动默认训练模式，forward过程会记录backward所需结果
+        forward_start = time.time()
         logits_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)  # [B, num_labels]
-        print("1!")
+        logger.info(
+            "[rank %s] step=%03d forward_done dt=%.3fs logits_shape=%s",
+            rank,
+            step,
+            time.time() - forward_start,
+            _shape_of(logits_enc),
+        )
 
         # MSE loss with one-hot labels (more stable than CE for MPC smoke test)
         num_labels = logits_enc.size(-1)
@@ -461,10 +541,14 @@ def main():
         loss_enc = (diff * diff).mean()
 
         # optimizer (create once on first step)
-        print("2!")
+        logger.info("[rank %s] step=%03d loss_snapshot=%s", rank, step, _loss_snapshot(loss_enc))
 
         if step == 0:
-            print("optim!")
+            logger.warning(
+                "[rank %s] step=%03d initializing optimizer and switching model to train mode after first forward",
+                rank,
+                step,
+            )
             private_model.train()
             lr = 0.01
             optimizer = ct.optim.SGD(private_model.parameters(), lr=lr)
@@ -474,28 +558,47 @@ def main():
         optimizer.zero_grad()
         
         if step == 1:
-            print("cfg-test")
+            logger.info("[rank %s] step=%03d cfg consistency check start", rank, step)
             from crypten.config import cfg as cfg_main
             import crypten.encoder as enc
 
-            rank = ct.communicator.get().get_rank()
-            print(f"[rank{rank}] id(cfg_main)={id(cfg)}  id(enc.cfg)={id(enc.cfg)}  same={id(cfg)==id(enc.cfg)}")
-            print(f"[rank{rank}] enc.cfg has encoder? {hasattr(enc.cfg,'encoder')}")
-            # print(hasattr(cfg, "encoder"))
-            # print(cfg.encoder.precision_bits)
-            print("done")
+            logger.info(
+                "[rank %s] cfg id(main/imported)=%s/%s same=%s enc_has_encoder=%s snapshot=%s",
+                rank,
+                id(cfg_main),
+                id(enc.cfg),
+                id(cfg_main) == id(enc.cfg),
+                hasattr(enc.cfg, "encoder"),
+                _cfg_snapshot(),
+            )
             # exit()
-        loss_enc.backward()
-        optimizer.step()
+        logger.info("[rank %s] step=%03d backward_start", rank, step)
+        try:
+            loss_enc.backward()
+        except Exception:
+            logger.exception(
+                "[rank %s] step=%03d backward_failed cfg=%s loss=%s",
+                rank,
+                step,
+                _cfg_snapshot(),
+                _loss_snapshot(loss_enc),
+            )
+            raise
+        logger.info("[rank %s] step=%03d backward_done", rank, step)
+
+        try:
+            optimizer.step()
+        except Exception:
+            logger.exception("[rank %s] step=%03d optimizer_step_failed", rank, step)
+            raise
+        logger.info("[rank %s] step=%03d optimizer_step_done", rank, step)
 
         # reveal loss (ALL ranks must call get_plain_text / reveal)
         loss_plain = loss_enc.get_plain_text().item()
-        # if ct.communicator.get().get_rank() == 0:
-        print("3!")
-        print(f"[train-smoke] step={step:03d} loss={loss_plain:.6f}")
+        logger.info("[rank %s] [train-smoke] step=%03d loss=%.6f", rank, step, loss_plain)
 
     if ct.communicator.get().get_rank() == 0:
-        print("[train-smoke] Done. (This script exits before private inference metrics.)")
+        logger.info("[train-smoke] done; elapsed=%.3fs", time.time() - start_time_infer)
     return
 
 

@@ -157,6 +157,57 @@
 - Command:
   - `./test_bert_base_comm_ultra_light.sh`
 
+---
+
+## Follow-up Issue D (Need True MPC-LoRA Finetuning)
+- Requirement:
+  - Stop using only classifier-head smoke behavior and provide a real MPC-LoRA finetuning path with separate code and shell entrypoints.
+
+### Core Cause
+- Previous light/smoke scripts were optimized for "run-through" and debugging, not for strict LoRA adaptation workflow.
+- We needed an independent script that:
+  - injects LoRA modules into transformer linear layers,
+  - freezes base weights,
+  - trains LoRA params (optionally classifier head),
+  - keeps MPC pipeline and evaluation/export behavior.
+
+### Applied Changes
+- Added new trainer:
+  - `examples/text-classification/run_glue_private_mpc_lora_train.py`
+- LoRA-specific implementation points:
+  - Added `LoRALinear` wrapper and recursive module replacement.
+  - Added trainable-parameter selector for LoRA (+optional classifier head).
+  - Added LoRA args:
+    - `--lora_r`
+    - `--lora_alpha`
+    - `--lora_dropout`
+    - `--lora_target_modules`
+    - `--freeze_classifier_head`
+  - Added optimizer args:
+    - `--learning_rate`
+    - `--momentum`
+  - Set train dataloader to `shuffle=True`.
+
+### New Shell Scripts
+- Standard MPC-LoRA run:
+  - `examples/text-classification/test_bert_base_comm_mpc_lora.sh`
+- Overnight preset:
+  - `examples/text-classification/test_bert_base_comm_mpc_lora_overnight.sh`
+- Nohup launcher:
+  - `examples/text-classification/run_mpc_lora_overnight_nohup.sh`
+
+### Recommended Usage
+1. Quick standard run:
+   - `bash test_bert_base_comm_mpc_lora.sh`
+2. Overnight run:
+   - `bash test_bert_base_comm_mpc_lora_overnight.sh`
+3. Background overnight:
+   - `bash run_mpc_lora_overnight_nohup.sh`
+
+### Notes
+- This is now a dedicated "true MPC-LoRA" path, separated from smoke and ultra-light scripts.
+- Default LoRA target is `query,value` (can be changed by `LORA_TARGET_MODULES` or `--lora_target_modules`).
+
 ### Scale-Up Plan After Pass-Through
 1. Increase `--max_train_steps` from `1` to `5/10`.
 2. Raise `--max_length` from `32` to `64`.

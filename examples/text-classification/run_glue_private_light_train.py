@@ -17,6 +17,7 @@
 """Testing a Transformers model in priavte for sequence classification on GLUE."""
 
 import argparse
+import builtins
 import json
 import logging
 import os
@@ -144,6 +145,57 @@ def _safe_metric_compute(metric, steps, rank, phase):
     return metric.compute()
 
 
+def _set_classifier_only_trainable(model):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    trainable_names = []
+    for name, param in model.named_parameters():
+        if name.startswith("classifier.") or name.startswith("score."):
+            param.requires_grad = True
+            trainable_names.append(name)
+
+    # Fallback: keep at least one parameter trainable to avoid optimizer failures.
+    if not trainable_names:
+        named_params = list(model.named_parameters())
+        if named_params:
+            last_name, last_param = named_params[-1]
+            last_param.requires_grad = True
+            trainable_names.append(last_name)
+    return trainable_names
+
+
+def _count_trainable_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def _install_print_filter():
+    original_print = builtins.print
+
+    def filtered_print(*args, **kwargs):
+        if args:
+            first = args[0]
+            if isinstance(first, str):
+                text = first.strip()
+                if "index_add_" in text:
+                    return
+                if text.startswith("index.shape:"):
+                    return
+                if text.startswith("flat_index"):
+                    return
+                if text.startswith("grad_output_flat"):
+                    return
+                if text.startswith("grad type:"):
+                    return
+                if text.startswith("grad.shape:"):
+                    return
+                if text.startswith("comm byte:"):
+                    return
+        return original_print(*args, **kwargs)
+
+    builtins.print = filtered_print
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     parser.add_argument(
@@ -266,6 +318,48 @@ def parse_args():
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
     parser.add_argument(
+        "--train_max_samples",
+        type=int,
+        default=-1,
+        help="Cap train split size before tokenization. -1 means full split.",
+    )
+    parser.add_argument(
+        "--eval_max_samples",
+        type=int,
+        default=-1,
+        help="Cap eval split size before tokenization. -1 means full split.",
+    )
+    parser.add_argument(
+        "--train_classifier_only",
+        action="store_true",
+        help="If passed, freeze encoder and train only classifier head parameters.",
+    )
+    parser.add_argument(
+        "--skip_private_eval",
+        action="store_true",
+        help="If passed, skip private evaluation after training.",
+    )
+    parser.add_argument(
+        "--skip_plain_eval",
+        action="store_true",
+        help="If passed, skip plaintext evaluation after decrypting model.",
+    )
+    parser.add_argument(
+        "--quick_run",
+        action="store_true",
+        help="Ultra-light preset: tiny sample, short sequence, 1 train step, classifier-only training, skip eval.",
+    )
+    parser.add_argument(
+        "--print_comm_cost",
+        action="store_true",
+        help="If passed, print CrypTen communication cost statistics during execution.",
+    )
+    parser.add_argument(
+        "--allow_spam_logs",
+        action="store_true",
+        help="If passed, do not filter verbose third-party debug prints (e.g. index_add debug).",
+    )
+    parser.add_argument(
         "--gpu_ids",
         type=str,
         default="",
@@ -290,6 +384,22 @@ def parse_args():
 def main():
     script_start_time = time.time()
     args = parse_args()
+
+    if args.quick_run:
+        args.pad_to_max_length = True
+        args.max_length = min(args.max_length, 32)
+        args.len_data = args.max_length
+        args.max_train_steps = 1
+        args.log_every_steps = 1
+        args.eval_max_steps = 1
+        args.per_device_train_batch_size = 1
+        args.per_device_eval_batch_size = 1
+        args.train_max_samples = 64 if args.train_max_samples < 0 else min(args.train_max_samples, 64)
+        args.eval_max_samples = 64 if args.eval_max_samples < 0 else min(args.eval_max_samples, 64)
+        args.train_classifier_only = True
+        args.skip_private_eval = True
+        args.skip_plain_eval = True
+
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_glue_private", args)
@@ -300,6 +410,8 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+    if not args.allow_spam_logs:
+        _install_print_filter()
 
     # CrypTen autograd walks graph recursively; deep graphs can exceed Python's default recursion limit (1000).
     old_recursion_limit = sys.getrecursionlimit()
@@ -309,6 +421,19 @@ def main():
     logger.info("train-smoke start pid=%s argv=%s", os.getpid(), " ".join(sys.argv))
     logger.info("python recursion limit %s -> %s", old_recursion_limit, sys.getrecursionlimit())
     logger.info("initial cfg snapshot=%s", _cfg_snapshot())
+    if args.quick_run:
+        logger.info(
+            "[quick-run] enabled: len=%s max_length=%s train_steps=%s train_samples=%s eval_samples=%s "
+            "classifier_only=%s skip_private_eval=%s skip_plain_eval=%s",
+            args.len_data,
+            args.max_length,
+            args.max_train_steps,
+            args.train_max_samples,
+            args.eval_max_samples,
+            args.train_classifier_only,
+            args.skip_private_eval,
+            args.skip_plain_eval,
+        )
 
 
     datasets.utils.logging.set_verbosity_warning()
@@ -343,6 +468,13 @@ def main():
     # https://huggingface.co/docs/datasets/loading_datasets.
 
     validation_key = "validation_matched" if args.task_name == "mnli" else "validation"
+
+    if args.train_max_samples > 0 and "train" in raw_datasets:
+        train_keep = min(args.train_max_samples, len(raw_datasets["train"]))
+        raw_datasets["train"] = raw_datasets["train"].select(range(train_keep))
+    if args.eval_max_samples > 0 and validation_key in raw_datasets:
+        eval_keep = min(args.eval_max_samples, len(raw_datasets[validation_key]))
+        raw_datasets[validation_key] = raw_datasets[validation_key].select(range(eval_keep))
 
     # Labels
     if args.task_name is not None:
@@ -387,6 +519,13 @@ def main():
         ignore_mismatched_sizes=args.ignore_mismatched_sizes,
         trust_remote_code=args.trust_remote_code,
     )
+    if args.train_classifier_only:
+        trainable_names = _set_classifier_only_trainable(model)
+        logger.info(
+            "[train-params] classifier-only mode: trainable=%s total_trainable_params=%s",
+            trainable_names,
+            _count_trainable_params(model),
+        )
 
     # Preprocessing the datasets
     if args.task_name is not None:
@@ -683,52 +822,60 @@ def main():
         time.time() - train_start_time,
     )
 
-    # Step 3A: private evaluation on validation split.
-    private_model.eval()
-    private_metric = evaluate.load("glue", args.task_name) if args.task_name is not None else evaluate.load("accuracy")
-    eval_steps = 0
-    eval_skipped_by_len = 0
-    for _, batch in enumerate(eval_dataloader):
-        if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
-            eval_skipped_by_len += 1
-            continue
+    private_eval_metric = {"skipped": True, "reason": "disabled"}
+    if not args.skip_private_eval:
+        # Step 3A: private evaluation on validation split.
+        private_model.eval()
+        private_metric = evaluate.load("glue", args.task_name) if args.task_name is not None else evaluate.load("accuracy")
+        eval_steps = 0
+        eval_skipped_by_len = 0
+        for _, batch in enumerate(eval_dataloader):
+            if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
+                eval_skipped_by_len += 1
+                continue
 
-        token_type_ids = batch.get("token_type_ids")
-        if token_type_ids is None:
-            token_type_ids = torch.zeros_like(batch["input_ids"])
+            token_type_ids = batch.get("token_type_ids")
+            if token_type_ids is None:
+                token_type_ids = torch.zeros_like(batch["input_ids"])
 
-        inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
-        attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
-        token_type_enc = ct.cryptensor(token_type_ids).to(device)
-        with ct.no_grad():
-            outputs_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)
+            inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
+            attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
+            token_type_enc = ct.cryptensor(token_type_ids).to(device)
+            with ct.no_grad():
+                outputs_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)
 
-        outputs = outputs_enc.get_plain_text().cpu()
-        predictions = outputs.argmax(dim=-1) if not is_regression else outputs.squeeze()
-        private_metric.add_batch(predictions=predictions, references=batch["labels"])
-        eval_steps += 1
+            outputs = outputs_enc.get_plain_text().cpu()
+            predictions = outputs.argmax(dim=-1) if not is_regression else outputs.squeeze()
+            private_metric.add_batch(predictions=predictions, references=batch["labels"])
+            eval_steps += 1
 
-        if args.eval_max_steps > 0 and eval_steps >= args.eval_max_steps:
-            break
+            if args.eval_max_steps > 0 and eval_steps >= args.eval_max_steps:
+                break
 
-    private_eval_metric = _safe_metric_compute(private_metric, eval_steps, rank, "eval-private")
-    if rank == 0:
-        logger.info(
-            "[eval-private] steps=%s skipped_by_len=%s metric=%s",
-            eval_steps,
-            eval_skipped_by_len,
-            private_eval_metric,
-        )
+        private_eval_metric = _safe_metric_compute(private_metric, eval_steps, rank, "eval-private")
+        if rank == 0:
+            logger.info(
+                "[eval-private] steps=%s skipped_by_len=%s metric=%s",
+                eval_steps,
+                eval_skipped_by_len,
+                private_eval_metric,
+            )
+    elif rank == 0:
+        logger.info("[eval-private] skipped by flag --skip_private_eval")
 
     # Step 3B: recover a plaintext model and run plaintext evaluation.
-    private_model.decrypt()
-    trained_model = private_model.to_pytorch().to(device)
-    trained_model.eval()
+    need_decrypt = (not args.skip_plain_eval) or (args.output_dir is not None)
+    trained_model = None
+    if need_decrypt:
+        private_model.decrypt()
+    if rank == 0 and ((not args.skip_plain_eval) or (args.output_dir is not None)):
+        trained_model = private_model.to_pytorch().to(device)
+        trained_model.eval()
 
-    plain_eval_metric = None
+    plain_eval_metric = {"skipped": True, "reason": "disabled"}
     plain_steps = 0
     plain_skipped_by_len = 0
-    if rank == 0:
+    if rank == 0 and not args.skip_plain_eval:
         plain_metric = evaluate.load("glue", args.task_name) if args.task_name is not None else evaluate.load("accuracy")
         for _, batch in enumerate(eval_dataloader):
             if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
@@ -765,12 +912,15 @@ def main():
             plain_skipped_by_len,
             plain_eval_metric,
         )
+    elif rank == 0:
+        logger.info("[eval-plain] skipped by flag --skip_plain_eval")
 
     if rank == 0 and args.output_dir is not None:
         trained_model_dir = os.path.join(args.output_dir, "trained_model")
         os.makedirs(trained_model_dir, exist_ok=True)
-        trained_model.save_pretrained(trained_model_dir)
-        tokenizer.save_pretrained(trained_model_dir)
+        if trained_model is not None:
+            trained_model.save_pretrained(trained_model_dir)
+            tokenizer.save_pretrained(trained_model_dir)
 
         summary = {
             "train_steps": global_step,
@@ -803,7 +953,7 @@ if __name__ == "__main__":
             main()
     else:
         # run with communication
-        with cfg.temp_override({"cost.estimate_cost": True, "cost.estimate_mode": "comm"}):
+        with cfg.temp_override({"cost.estimate_cost": args.print_comm_cost, "cost.estimate_mode": "comm"}):
 
             launcher = MultiProcessLauncher(2, main)
             launcher.start()

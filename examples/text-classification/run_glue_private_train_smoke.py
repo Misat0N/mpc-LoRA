@@ -256,7 +256,14 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+
+    # CrypTen autograd walks graph recursively; deep graphs can exceed Python's default recursion limit (1000).
+    old_recursion_limit = sys.getrecursionlimit()
+    target_recursion_limit = max(old_recursion_limit, 20000)
+    if target_recursion_limit != old_recursion_limit:
+        sys.setrecursionlimit(target_recursion_limit)
     logger.info("train-smoke start pid=%s argv=%s", os.getpid(), " ".join(sys.argv))
+    logger.info("python recursion limit %s -> %s", old_recursion_limit, sys.getrecursionlimit())
     logger.info("initial cfg snapshot=%s", _cfg_snapshot())
 
 
@@ -430,7 +437,10 @@ def main():
 
     device = "cuda"
     logger.info("[rank %s] before ct.init initialized=%s", _get_rank(), ct.is_initialized())
-    ct.init()
+    if not ct.is_initialized():
+        ct.init()
+    else:
+        logger.warning("[rank %s] skip ct.init(): already initialized in launcher subprocess", _get_rank())
     rank = _get_rank()
     logger.info("[rank %s] crypten initialized=%s", rank, ct.is_initialized())
     logger.info("[rank %s] cfg after crypten init=%s", rank, _cfg_snapshot())
@@ -438,6 +448,10 @@ def main():
     # exit()
     dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
     private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).encrypt().to(device)
+    private_model.train()
+    lr = 0.01
+    optimizer = ct.optim.SGD(private_model.parameters(), lr=lr)
+    logger.info("[rank %s] model set to train mode; optimizer initialized (lr=%s)", rank, lr)
     # 模型不加密
     # private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).to(device)
 
@@ -543,18 +557,6 @@ def main():
         # optimizer (create once on first step)
         logger.info("[rank %s] step=%03d loss_snapshot=%s", rank, step, _loss_snapshot(loss_enc))
 
-        if step == 0:
-            logger.warning(
-                "[rank %s] step=%03d initializing optimizer and switching model to train mode after first forward",
-                rank,
-                step,
-            )
-            private_model.train()
-            lr = 0.01
-            optimizer = ct.optim.SGD(private_model.parameters(), lr=lr)
-        # else:
-        #     print("step 0 finished!")
-        #     exit()
         optimizer.zero_grad()
         
         if step == 1:

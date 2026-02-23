@@ -868,8 +868,12 @@ def main():
     trained_model = None
     if need_decrypt:
         private_model.decrypt()
+        # Keep decrypted CrypTen parameters on CPU so to_pytorch() can assign storage safely.
+        private_model = private_model.to("cpu")
     if rank == 0 and ((not args.skip_plain_eval) or (args.output_dir is not None)):
-        trained_model = private_model.to_pytorch().to(device)
+        trained_model = private_model.to_pytorch()
+        if not args.skip_plain_eval:
+            trained_model = trained_model.to(device)
         trained_model.eval()
 
     plain_eval_metric = {"skipped": True, "reason": "disabled"}

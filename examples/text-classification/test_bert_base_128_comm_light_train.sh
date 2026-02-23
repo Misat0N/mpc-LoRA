@@ -5,6 +5,7 @@ export TASK_NAME=sst2
 python run_glue_private_light_train.py \
   --model_name_or_path andeskyl/bert-base-cased-$TASK_NAME \
   --task_name $TASK_NAME \
+  --gpu_ids 0,1 \
   --len_data 128 \
   --num_data -1 \
   --pad_to_max_length \

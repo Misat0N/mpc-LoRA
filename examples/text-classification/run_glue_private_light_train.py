@@ -265,6 +265,15 @@ def parse_args():
         action="store_true",
         help="Whether or not to enable to load a pretrained model whose head dimensions are different.",
     )
+    parser.add_argument(
+        "--gpu_ids",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated GPU ids for process mapping, e.g. '0,1'. "
+            "If empty, use all visible CUDA devices and map by rank."
+        ),
+    )
     args = parser.parse_args()
 
     # Sanity checks
@@ -472,14 +481,43 @@ def main():
     else:
         metric = evaluate.load("accuracy")
 
-    device = "cuda"
     logger.info("[rank %s] before ct.init initialized=%s", _get_rank(), ct.is_initialized())
     if not ct.is_initialized():
         ct.init()
     else:
         logger.warning("[rank %s] skip ct.init(): already initialized in launcher subprocess", _get_rank())
     rank = _get_rank()
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for private light training, but no CUDA device is available.")
+
+    visible_gpu_count = torch.cuda.device_count()
+    if visible_gpu_count < 1:
+        raise RuntimeError("No visible CUDA devices.")
+
+    if args.gpu_ids.strip():
+        gpu_id_list = [int(x.strip()) for x in args.gpu_ids.split(",") if x.strip()]
+    else:
+        gpu_id_list = list(range(visible_gpu_count))
+
+    if len(gpu_id_list) < 1:
+        raise ValueError("--gpu_ids is empty after parsing.")
+
+    local_gpu_id = gpu_id_list[rank % len(gpu_id_list)]
+    if local_gpu_id < 0 or local_gpu_id >= visible_gpu_count:
+        raise ValueError(
+            f"Invalid gpu id {local_gpu_id}. Visible cuda device count={visible_gpu_count}, --gpu_ids='{args.gpu_ids}'."
+        )
+    torch.cuda.set_device(local_gpu_id)
+    device = f"cuda:{local_gpu_id}"
+
     logger.info("[rank %s] crypten initialized=%s", rank, ct.is_initialized())
+    logger.info(
+        "[rank %s] device mapping: visible_gpus=%s gpu_ids=%s selected_device=%s",
+        rank,
+        visible_gpu_count,
+        gpu_id_list,
+        device,
+    )
     logger.info("[rank %s] cfg after crypten init=%s", rank, _cfg_snapshot())
     # print("done")
     # exit()

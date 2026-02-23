@@ -26,7 +26,6 @@ import sys
 import time
 
 import datasets
-import evaluate
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -53,6 +52,11 @@ import crypten as ct
 from crypten.config import cfg
 from multiprocess_launcher import MultiProcessLauncher
 
+try:
+    import evaluate
+except ModuleNotFoundError:
+    evaluate = None
+
 
 # from star_linear_fixed import replace_linear_with_star_fixed
 
@@ -78,6 +82,14 @@ task_to_keys = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+def _require_evaluate(need_eval):
+    if evaluate is None and need_eval:
+        raise ModuleNotFoundError(
+            "No module named 'evaluate'. Install it in your current env: "
+            "`python -m pip install evaluate`."
+        )
 
 
 def _get_rank():
@@ -508,6 +520,9 @@ def main():
         args.freeze_classifier_head = False
         args.skip_private_eval = True
         args.skip_plain_eval = True
+
+    need_eval = (not args.skip_private_eval) or (not args.skip_plain_eval)
+    _require_evaluate(need_eval)
 
     if args.seed is not None:
         set_seed(args.seed)

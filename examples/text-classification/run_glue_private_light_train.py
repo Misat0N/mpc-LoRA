@@ -41,6 +41,7 @@ from transformers import (
     DataCollatorWithPadding,
     PretrainedConfig,
     default_data_collator,
+    set_seed,
 )
 
 from transformers.utils import check_min_version, send_example_telemetry
@@ -399,6 +400,9 @@ def main():
         args.train_classifier_only = True
         args.skip_private_eval = True
         args.skip_plain_eval = True
+
+    if args.seed is not None:
+        set_seed(args.seed)
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.

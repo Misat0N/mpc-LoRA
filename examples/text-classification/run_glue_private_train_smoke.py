@@ -193,10 +193,34 @@ def parse_args():
         help="If passed, will use a slow tokenizer (not backed by the 🤗 Tokenizers library).",
     )
     parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=1,
+        help="Batch size (per device) for the train dataloader.",
+    )
+    parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
         default=8,
         help="Batch size (per device) for the evaluation dataloader.",
+    )
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=5,
+        help="Maximum number of training steps to run.",
+    )
+    parser.add_argument(
+        "--log_every_steps",
+        type=int,
+        default=1,
+        help="Logging interval for training steps.",
+    )
+    parser.add_argument(
+        "--eval_max_steps",
+        type=int,
+        default=-1,
+        help="Maximum number of evaluation steps after training. -1 means full eval split.",
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the output.")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -427,7 +451,9 @@ def main():
         # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=None)
 
+    train_dataset = processed_datasets["train"]
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+    train_dataloader = DataLoader(train_dataset, collate_fn=data_collator, batch_size=args.per_device_train_batch_size)
 
     # Get the metric function
     if args.task_name is not None:
@@ -504,44 +530,42 @@ def main():
     # ct_model = replace_linear_with_star_fixed(ct_model)   # 仅这一行
     # private_model = ct_model.encrypt().to(device)
 
-    model.eval()
-    samples_seen = 0
-    start_time_infer = time.time()
-    max_steps = 5
-    logger.info("[rank %s] entering train-smoke loop max_steps=%s", rank, max_steps)
-    for step, batch in enumerate(eval_dataloader):
+    train_start_time = time.time()
+    global_step = 0
+    logger.info(
+        "[rank %s] entering short-train loop max_train_steps=%s train_batch=%s",
+        rank,
+        args.max_train_steps,
+        args.per_device_train_batch_size,
+    )
+    for _, batch in enumerate(train_dataloader):
         rank = _get_rank()
         logger.info(
-            "[rank %s] step=%03d batch_keys=%s input_shape=%s label_shape=%s",
+            "[rank %s] train_step=%03d batch_keys=%s input_shape=%s label_shape=%s",
             rank,
-            step,
+            global_step,
             sorted(batch.keys()),
             _shape_of(batch["input_ids"]),
             _shape_of(batch["labels"]),
         )
-        # --- USER MOD: training smoke test (no LoRA) ---
-        # keep batch/seq small via args (or by trimming dataset) for quick check
-        if step >= max_steps:
-            logger.info("[rank %s] step=%03d reached max_steps=%s; stop", rank, step, max_steps)
-            break
-    
-        # if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
-        #     continue
-        if "token_type_ids" not in batch:
-            logger.error("[rank %s] token_type_ids missing in batch. keys=%s", rank, sorted(batch.keys()))
-            raise KeyError("token_type_ids")
+        if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
+            continue
+
+        token_type_ids = batch.get("token_type_ids")
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(batch["input_ids"])
         inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
         attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
-        token_type_enc = ct.cryptensor(batch["token_type_ids"]).to(device)
+        token_type_enc = ct.cryptensor(token_type_ids).to(device)
 
         # forward (NO ct.no_grad for training)
         # 在不设置ct.no_grad时自动默认训练模式，forward过程会记录backward所需结果
         forward_start = time.time()
         logits_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)  # [B, num_labels]
         logger.info(
-            "[rank %s] step=%03d forward_done dt=%.3fs logits_shape=%s",
+            "[rank %s] train_step=%03d forward_done dt=%.3fs logits_shape=%s",
             rank,
-            step,
+            global_step,
             time.time() - forward_start,
             _shape_of(logits_enc),
         )
@@ -555,12 +579,12 @@ def main():
         loss_enc = (diff * diff).mean()
 
         # optimizer (create once on first step)
-        logger.info("[rank %s] step=%03d loss_snapshot=%s", rank, step, _loss_snapshot(loss_enc))
+        logger.info("[rank %s] train_step=%03d loss_snapshot=%s", rank, global_step, _loss_snapshot(loss_enc))
 
         optimizer.zero_grad()
         
-        if step == 1:
-            logger.info("[rank %s] step=%03d cfg consistency check start", rank, step)
+        if global_step == 1:
+            logger.info("[rank %s] train_step=%03d cfg consistency check start", rank, global_step)
             from crypten.config import cfg as cfg_main
             import crypten.encoder as enc
 
@@ -574,33 +598,133 @@ def main():
                 _cfg_snapshot(),
             )
             # exit()
-        logger.info("[rank %s] step=%03d backward_start", rank, step)
+        logger.info("[rank %s] train_step=%03d backward_start", rank, global_step)
         try:
             loss_enc.backward()
         except Exception:
             logger.exception(
-                "[rank %s] step=%03d backward_failed cfg=%s loss=%s",
+                "[rank %s] train_step=%03d backward_failed cfg=%s loss=%s",
                 rank,
-                step,
+                global_step,
                 _cfg_snapshot(),
                 _loss_snapshot(loss_enc),
             )
             raise
-        logger.info("[rank %s] step=%03d backward_done", rank, step)
+        logger.info("[rank %s] train_step=%03d backward_done", rank, global_step)
 
         try:
             optimizer.step()
         except Exception:
-            logger.exception("[rank %s] step=%03d optimizer_step_failed", rank, step)
+            logger.exception("[rank %s] train_step=%03d optimizer_step_failed", rank, global_step)
             raise
-        logger.info("[rank %s] step=%03d optimizer_step_done", rank, step)
+        logger.info("[rank %s] train_step=%03d optimizer_step_done", rank, global_step)
 
         # reveal loss (ALL ranks must call get_plain_text / reveal)
         loss_plain = loss_enc.get_plain_text().item()
-        logger.info("[rank %s] [train-smoke] step=%03d loss=%.6f", rank, step, loss_plain)
+        global_step += 1
+        if global_step % max(1, args.log_every_steps) == 0:
+            logger.info("[rank %s] [train] step=%03d loss=%.6f", rank, global_step, loss_plain)
+        if args.max_train_steps > 0 and global_step >= args.max_train_steps:
+            logger.info("[rank %s] reached max_train_steps=%s", rank, args.max_train_steps)
+            break
+    logger.info(
+        "[rank %s] short-train finished steps=%s elapsed=%.3fs",
+        rank,
+        global_step,
+        time.time() - train_start_time,
+    )
 
-    if ct.communicator.get().get_rank() == 0:
-        logger.info("[train-smoke] done; elapsed=%.3fs", time.time() - start_time_infer)
+    # Step 3A: private evaluation on validation split.
+    private_model.eval()
+    private_metric = evaluate.load("glue", args.task_name) if args.task_name is not None else evaluate.load("accuracy")
+    eval_steps = 0
+    for _, batch in enumerate(eval_dataloader):
+        if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
+            continue
+
+        token_type_ids = batch.get("token_type_ids")
+        if token_type_ids is None:
+            token_type_ids = torch.zeros_like(batch["input_ids"])
+
+        inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
+        attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
+        token_type_enc = ct.cryptensor(token_type_ids).to(device)
+        with ct.no_grad():
+            outputs_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)
+
+        outputs = outputs_enc.get_plain_text().cpu()
+        predictions = outputs.argmax(dim=-1) if not is_regression else outputs.squeeze()
+        private_metric.add_batch(predictions=predictions, references=batch["labels"])
+        eval_steps += 1
+
+        if args.eval_max_steps > 0 and eval_steps >= args.eval_max_steps:
+            break
+
+    private_eval_metric = private_metric.compute()
+    if rank == 0:
+        logger.info("[eval-private] steps=%s metric=%s", eval_steps, private_eval_metric)
+
+    # Step 3B: recover a plaintext model and run plaintext evaluation.
+    private_model.decrypt()
+    trained_model = private_model.to_pytorch().to(device)
+    trained_model.eval()
+
+    plain_eval_metric = None
+    plain_steps = 0
+    if rank == 0:
+        plain_metric = evaluate.load("glue", args.task_name) if args.task_name is not None else evaluate.load("accuracy")
+        for _, batch in enumerate(eval_dataloader):
+            if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
+                continue
+
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            token_type_ids = batch.get("token_type_ids")
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids.to(device)
+
+            with torch.no_grad():
+                if token_type_ids is not None:
+                    outputs = trained_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        token_type_ids=token_type_ids,
+                    )
+                else:
+                    outputs = trained_model(input_ids=input_ids, attention_mask=attention_mask)
+
+            predictions = outputs.logits.argmax(dim=-1) if not is_regression else outputs.logits.squeeze()
+            plain_metric.add_batch(predictions=predictions.cpu(), references=batch["labels"])
+            plain_steps += 1
+
+            if args.eval_max_steps > 0 and plain_steps >= args.eval_max_steps:
+                break
+
+        plain_eval_metric = plain_metric.compute()
+        logger.info("[eval-plain] steps=%s metric=%s", plain_steps, plain_eval_metric)
+
+    if rank == 0 and args.output_dir is not None:
+        trained_model_dir = os.path.join(args.output_dir, "trained_model")
+        os.makedirs(trained_model_dir, exist_ok=True)
+        trained_model.save_pretrained(trained_model_dir)
+        tokenizer.save_pretrained(trained_model_dir)
+
+        summary = {
+            "train_steps": global_step,
+            "private_eval_metric": private_eval_metric,
+            "plain_eval_metric": plain_eval_metric,
+            "task_name": args.task_name,
+            "max_train_steps": args.max_train_steps,
+            "eval_max_steps": args.eval_max_steps,
+        }
+        summary_path = os.path.join(args.output_dir, "train_eval_summary.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        logger.info("[save] trained model saved to %s", trained_model_dir)
+        logger.info("[save] summary saved to %s", summary_path)
+
+    if rank == 0:
+        logger.info("[train+eval] total elapsed=%.3fs", time.time() - script_start_time)
     return
 
 

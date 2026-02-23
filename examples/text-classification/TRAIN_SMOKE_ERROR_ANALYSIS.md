@@ -69,3 +69,25 @@
    - `python recursion limit old -> new`
    - `backward_failed` 的 `loss_snapshot` 与 `cfg_snapshot`
 
+## 6. 升级后的短程训练与评估（Step 2 + Step 3）
+
+`run_glue_private_train_smoke.py` 已扩展为：
+
+- 短程私有训练（使用 `train` split）
+- 训练后私有评估（validation）
+- 训练后明文评估（validation）
+- 导出训练后模型到 `output_dir/trained_model`
+- 记录汇总到 `output_dir/train_eval_summary.json`
+
+新增关键参数：
+
+- `--per_device_train_batch_size`：训练 batch size
+- `--max_train_steps`：短程训练步数
+- `--log_every_steps`：训练日志间隔
+- `--eval_max_steps`：评估步数上限（`-1` 为全量）
+
+推荐命令（已写入 `test_bert_base_128_comm_train_smoke.sh`）：
+
+```bash
+./test_bert_base_128_comm_train_smoke.sh
+```

@@ -275,3 +275,365 @@
      - now: decrypt + recover via `state_dict` into original PyTorch template model.
   3. Kept compatibility fallback:
      - fallback to `to_pytorch()` only if `state_dict` recovery cannot match parameters.
+
+### Why This Works (Detailed)
+1. `to_pytorch()` is a structure-dependent conversion path.
+It relies on CrypTen's module traversal assumptions about submodule internals.
+When custom wrapper modules include non-parameter helper modules (such as `nn.Identity`) in unexpected locations, conversion code can try to treat them like tensor-bearing leaves and access `.data`, which fails.
+2. Functional dropout/no-op avoids problematic module registration.
+By using a float probability (`self.lora_dropout_p`) and `F.dropout(...)` only in forward, we preserve behavior but remove `Identity` from module tree.
+This makes the wrapped LoRA layer structurally closer to what CrypTen converter expects.
+3. State-dict recovery is key-based tensor loading, not structure-heuristic conversion.
+After decrypt, we read `private_model.state_dict()`, convert values to plain CPU tensors, and load them into the original PyTorch template model with `load_state_dict(..., strict=False)`.
+This path matches parameters by key and shape, and is typically more robust for custom modules than a full graph/module conversion.
+4. Fallback remains for compatibility.
+If state-dict recovery cannot match parameters, code still tries `to_pytorch()` so behavior stays backward compatible.
+
+### Current Run Commands
+1. Standard LoRA run (foreground):
+`bash test_bert_base_comm_mpc_lora.sh`
+2. Overnight preset (foreground):
+`bash test_bert_base_comm_mpc_lora_overnight.sh`
+3. Overnight preset (background):
+`bash run_mpc_lora_overnight_nohup.sh`
+4. Recommended for your 4-GPU machine (still 2-party MPC):
+`GPU_IDS=0,1 bash test_bert_base_comm_mpc_lora_overnight.sh`
+5. If one pair is occupied, switch pair:
+`GPU_IDS=2,3 bash test_bert_base_comm_mpc_lora_overnight.sh`
+6. Track latest background log:
+`tail -f logs/mpc_lora_overnight_*.log`
+
+---
+
+# 中文翻译版（Chinese Translation）
+
+## 训练错误日志（Light Train 拆分）
+
+## 背景
+- 命令：
+  - `./test_bert_base_128_comm_train_smoke.sh`
+- 项目路径：
+  - `examples/text-classification/`
+- 模式：
+  - 2 进程 CrypTen launcher
+
+## 最近一次失败（已记录）
+- 崩溃点：
+  - `run_glue_private_train_smoke.py:663`
+  - `private_eval_metric = private_metric.compute()`
+- 错误：
+  - `ValueError: Evaluation module cache file doesn't exist. Please make sure that you call add or add_batch at least once before calling compute.`
+- 进程结果：
+  - `AssertionError: process 0 has non-zero exit code 1`
+
+## 根因
+- 在 eval 循环中，所有 batch 在 `add_batch()` 前都被过滤掉了（`--len_data 128` + 动态 padding + 序列长度不一致）。
+- 结果：`private_metric` 没有收到任何样本，随后 `compute()` 抛出 ValueError。
+
+## 为什么之前的日志容易误导
+- ONNX shape inference 警告和 CrypTen deprecation 警告噪声很多，但不是这次崩溃的直接原因。
+- 这次运行的直接阻塞点是：`compute()` 前 metric 缓冲区为空。
+
+## 已应用修改
+
+### 1) 恢复可运行的 smoke 流程
+- 已恢复：
+  - `examples/text-classification/run_glue_private_train_smoke.py`
+  - `examples/text-classification/test_bert_base_128_comm_train_smoke.sh`
+- 目标：
+  - 保持 smoke 脚本聚焦于“快速端到端可运行”。
+
+### 2) 将正式轻量训练迁移到新文件
+- 新增：
+  - `examples/text-classification/run_glue_private_light_train.py`
+  - `examples/text-classification/test_bert_base_128_comm_light_train.sh`
+
+### 3) 在 light train 中增加空 metric 保护
+- 在 `run_glue_private_light_train.py` 中：
+  - 新增 `_safe_metric_compute(...)`。
+  - 若 `eval_steps == 0` 或 `plain_steps == 0`，跳过 `compute()` 并返回结构化的 skipped 结果。
+  - 在 private/plain eval 日志中新增 `skipped_by_len` 计数。
+
+## 当前推荐命令
+- Smoke：
+  - `./test_bert_base_128_comm_train_smoke.sh`
+- 轻量训练 + 评估：
+  - `./test_bert_base_128_comm_light_train.sh`
+
+## 验证清单
+- Smoke 运行不应在 evaluate `compute()` 处失败。
+- Light 运行应当：
+  - 要么产出 metric 数值，
+  - 要么明确记录因零 batch 导致的 metric skipped，且不崩溃。
+
+---
+
+## 后续问题 A（首次 backward 期间 OOM）
+- 命令：
+  - `./test_bert_base_128_comm_light_train.sh`
+- 崩溃点：
+  - `run_glue_private_light_train.py:614`
+  - `loss_enc.backward()`
+- 错误：
+  - `torch.cuda.OutOfMemoryError: Tried to allocate 1.66 GiB ...`
+- 次级错误：
+  - `RuntimeError: ... Connection closed by peer ...`（rank0 OOM 退出触发 rank1 通信失败）
+
+### 根因
+- 两个 MPC rank 都使用了默认 `cuda`（等效落在同一张 GPU），造成显存争用。
+- BERT + MPC backward 的显存与通信开销很高，即使 batch size=1 也可能 OOM。
+
+### 已应用修复
+- 在 light train 脚本新增 GPU 映射参数：
+  - `--gpu_ids`（示例：`0,1`）
+- 基于 rank 的映射：
+  - 每个 rank 按索引选择各自 GPU
+  - 显式 `torch.cuda.set_device(...)`
+- 启动脚本已更新：
+  - `test_bert_base_128_comm_light_train.sh` 现在传递 `--gpu_ids 0,1`
+
+---
+
+## 后续问题 B（约 90 分钟后仍无 `[train] step=... loss=...`）
+- 现象：
+  - 训练看起来卡在重复日志：
+    - `[DEBUG index_add_] ...`
+    - `comm byte: 10.49 GB, round: 1520`
+  - 长时间看不到 `[train] step=... loss=...`。
+
+### 诊断
+- 运行在第一次 backward 路径内部耗时非常长，同时第三方 debug 输出和通信代价打印大量刷屏。
+- 日志洪泛严重降低可观测性（并可能因控制台 I/O 导致实际运行进一步变慢）。
+
+### 已应用修复
+- 在 `run_glue_private_light_train.py` 增加日志过滤：
+  - 默认过滤 `index_add_` 调试刷屏
+  - 默认过滤重复 `comm byte: ...`
+- 增加运行开关：
+  - `--print_comm_cost`（默认关闭）
+  - `--allow_spam_logs`（默认关闭）
+- 调整 light smoke 默认长度：
+  - `test_bert_base_128_comm_light_train.sh` 中 `--max_train_steps` 从 `100` 改为 `10`
+
+### 当前运行建议
+- 先用下面命令做端到端验证：
+  - `./test_bert_base_128_comm_light_train.sh`
+- 若 step0 仍过慢，先降低序列长度：
+  - `--len_data 64 --max_length 64`
+
+---
+
+## 后续问题 C（需要一个保证可跑通的配置）
+- 需求：
+  - 构建 ultra-light 训练路径，优先保证“可以跑通”，而非指标质量。
+
+### 集成设计（最小运行路径）
+- 在以下文件加入 quick-run 预设：
+  - `examples/text-classification/run_glue_private_light_train.py`
+- 新增参数：
+  - `--quick_run`
+  - `--train_max_samples`
+  - `--eval_max_samples`
+  - `--train_classifier_only`
+  - `--skip_private_eval`
+  - `--skip_plain_eval`
+- 保留稳定性参数：
+  - `--gpu_ids`
+  - `--print_comm_cost`（默认关闭）
+  - `--allow_spam_logs`（默认关闭）
+
+### `--quick_run` 生效行为
+- 强制使用小而稳定的配置：
+  - 固定短序列（`max_length <= 32`，`len_data = max_length`）
+  - 单步训练（`max_train_steps = 1`）
+  - 小样本上限（`train_max_samples <= 64`，`eval_max_samples <= 64`）
+  - batch size 为 1
+  - 仅训练分类头
+  - 默认跳过 private/plain eval
+- 目标：
+  - 验证 MPC 训练链路至少能完成一次 backward + optimizer。
+
+### 额外运行安全措施
+- 默认启用 print 过滤：
+  - `index_add_` 调试刷屏
+  - 重复 `comm byte: ...`
+- 增加同步 decrypt 逻辑：
+  - 当跳过 eval 但需要导出模型时，避免 rank 间失同步。
+
+### 新的一键脚本
+- 新增：
+  - `examples/text-classification/test_bert_base_comm_ultra_light.sh`
+- 命令：
+  - `./test_bert_base_comm_ultra_light.sh`
+
+---
+
+## 后续问题 D（需要真正的 MPC-LoRA 微调）
+- 需求：
+  - 不再使用仅分类头 smoke 行为，提供独立的真实 MPC-LoRA 微调路径（代码与 shell 入口分离）。
+
+### 核心原因
+- 之前 light/smoke 脚本主要为“跑通”和调试优化，并非严格 LoRA 适配工作流。
+- 需要独立脚本来完成：
+  - 向 transformer 线性层注入 LoRA；
+  - 冻结基础权重；
+  - 训练 LoRA 参数（可选训练分类头）；
+  - 维持 MPC 训练、评估和导出流程。
+
+### 已应用修改
+- 新增训练器：
+  - `examples/text-classification/run_glue_private_mpc_lora_train.py`
+- LoRA 相关实现点：
+  - 增加 `LoRALinear` 包装与递归替换。
+  - 增加 LoRA 可训练参数选择（可选带分类头）。
+  - 增加 LoRA 参数：
+    - `--lora_r`
+    - `--lora_alpha`
+    - `--lora_dropout`
+    - `--lora_target_modules`
+    - `--freeze_classifier_head`
+  - 增加优化器参数：
+    - `--learning_rate`
+    - `--momentum`
+  - 训练 dataloader 设置为 `shuffle=True`。
+
+### 新增 shell 脚本
+- 标准 MPC-LoRA 训练：
+  - `examples/text-classification/test_bert_base_comm_mpc_lora.sh`
+- 过夜预设：
+  - `examples/text-classification/test_bert_base_comm_mpc_lora_overnight.sh`
+- nohup 启动器：
+  - `examples/text-classification/run_mpc_lora_overnight_nohup.sh`
+
+### 推荐使用方式
+1. 标准快速运行：
+   - `bash test_bert_base_comm_mpc_lora.sh`
+2. 过夜运行：
+   - `bash test_bert_base_comm_mpc_lora_overnight.sh`
+3. 后台过夜运行：
+   - `bash run_mpc_lora_overnight_nohup.sh`
+
+### 说明
+- 现在已有独立的“真实 MPC-LoRA”路径，与 smoke/ultra-light 脚本分离。
+- 默认 LoRA target 为 `query,value`（可通过 `LORA_TARGET_MODULES` 或 `--lora_target_modules` 修改）。
+
+### 跑通后的逐步放量计划
+1. 将 `--max_train_steps` 从 `1` 提升到 `5/10`。
+2. 将 `--max_length` 从 `32` 提升到 `64`。
+3. 若需要全参数行为，移除 `--train_classifier_only`。
+4. 训练环节稳定后，再移除 skip 参数开启完整评估。
+
+---
+
+## 后续问题 E（LoRA 运行在 `to_pytorch()` 崩溃）
+- 命令上下文：
+  - `test_bert_base_comm_mpc_lora_overnight.sh`
+- 崩溃点：
+  - `run_glue_private_mpc_lora_train.py:1036`
+  - `trained_model = private_model.to_pytorch()`
+- 错误：
+  - `AttributeError: 'Identity' object has no attribute 'data'`
+- 进程结果：
+  - `AssertionError: process 0 has non-zero exit code 1`
+
+### 观察事实
+- 分布式通信初始化完成。
+- 数据加载与 tokenization 完成。
+- 失败发生在训练/评估后的 decrypt/export 阶段。
+- 该失败不是前述 ONNX/deprecation 类警告引起。
+
+### 根因分析
+- 现有 LoRA wrapper 在 `LoRALinear` 中引入了 `nn.Identity()` 子模块（`self.dropout`）。
+- CrypTen `to_pytorch()` 的转换路径会假设相关子模块可暴露类似 tensor 的 `.data`。
+- 在模块遍历中，`Identity` 被当作应有 tensor 数据的节点处理，触发：
+  - `'Identity' object has no attribute 'data'`。
+
+### 临时绕过方案（先保证任务不断）
+- 在过夜任务中跳过明文转换/评估/导出：
+  - 传 `--skip_plain_eval`
+  - 避免触发强依赖 `to_pytorch()` 的导出路径
+- 若只关心 private 指标，可保留：
+  - private training + private eval summary
+- shell 快速开关：
+  - `SKIP_PLAIN_EVAL=1`
+
+### 建议代码修复（最小且安全）
+1. 在 LoRA 实现中避免把 `nn.Identity()` 注册为 wrapped linear 的子模块。
+2. 改为函数式 dropout/no-op：
+   - 使用 `self.lora_dropout_p`（float），而不是 `self.dropout = nn.Identity()`
+   - 在 forward 中仅当 `p > 0` 时应用 dropout，否则直接走输入。
+3. 保留导出兜底：
+   - 对 `to_pytorch()` 增加 try/except，避免明文导出失败导致整任务崩溃；
+   - 仍保存 `train_eval_summary.json`，并记录 `"plain_eval_metric": {"skipped": true, "reason": "..."}`。
+
+### 修复后验证清单
+1. 日志中不再出现 `AttributeError: 'Identity' object has no attribute 'data'`。
+2. 任务结束时应满足以下之一：
+   - 明文模型产物已保存；
+   - 明确记录 plain eval/export skipped 原因且不崩溃。
+3. launcher 最终退出码为 0。
+
+### 已实施的根因修复
+- 已更新文件：
+  - `examples/text-classification/run_glue_private_mpc_lora_train.py`
+- 修改内容：
+  1. 移除 LoRA wrapper 中的 `nn.Identity()` 子模块；
+     - 替换为函数式 dropout/no-op。
+  2. 替换脆弱转换路径：
+     - 旧：`trained_model = private_model.to_pytorch()`
+     - 新：decrypt 后通过 `state_dict` 回填到原始 PyTorch 模型模板。
+  3. 保留兼容 fallback：
+     - 仅在 `state_dict` 恢复无法匹配参数时，才回退到 `to_pytorch()`。
+
+### 为什么这样有效（详细说明）
+1. `to_pytorch()` 是结构依赖型转换路径。  
+它依赖 CrypTen 对子模块内部结构的遍历假设。自定义 wrapper 若包含非参数辅助模块（如 `nn.Identity`）且位置不在预期路径上，转换代码可能把它当成张量叶子并访问 `.data`，从而失败。
+2. 函数式 dropout/no-op 可避免问题模块注册。  
+使用浮点概率（`self.lora_dropout_p`）并在 forward 内调用 `F.dropout(...)`，可保持行为一致，同时把 `Identity` 从模块树中移除，结构更符合 CrypTen 转换器预期。
+3. `state_dict` 恢复是“按 key/shape 对齐”的张量加载，不依赖模块结构启发式。  
+decrypt 后读取 `private_model.state_dict()`，将值转为 CPU 明文 tensor，再 `load_state_dict(..., strict=False)` 回填到原始 PyTorch 模型。对于自定义模块，这通常比完整图/模块转换更稳健。
+4. 保留 fallback 兼顾兼容性。  
+如果 `state_dict` 恢复无法匹配，代码仍会尝试 `to_pytorch()`，保持向后兼容。
+
+### 当前运行命令
+1. 标准 LoRA（前台）：
+`bash test_bert_base_comm_mpc_lora.sh`
+2. 过夜预设（前台）：
+`bash test_bert_base_comm_mpc_lora_overnight.sh`
+3. 过夜预设（后台）：
+`bash run_mpc_lora_overnight_nohup.sh`
+4. 4 卡机器推荐（仍是 2-party MPC）：
+`GPU_IDS=0,1 bash test_bert_base_comm_mpc_lora_overnight.sh`
+5. 一对卡被占用时切换：
+`GPU_IDS=2,3 bash test_bert_base_comm_mpc_lora_overnight.sh`
+6. 跟踪后台日志：
+`tail -f logs/mpc_lora_overnight_*.log`
+
+---
+
+## Follow-up Issue F (Empty Output Folder After Foreground Run)
+- Symptom:
+  - `output_dir` exists, but expected artifacts are missing.
+  - sometimes `trained_model/` is empty.
+
+### Root Cause
+- Plain-model recovery/export could fail before summary writing.
+- Previous flow created/entered save path assuming plaintext export succeeds, which can lead to confusing empty directories.
+
+### Applied Fix
+- File:
+  - `examples/text-classification/run_glue_private_mpc_lora_train.py`
+- Changes:
+  1. Wrap plaintext model recovery in `try/except`.
+  2. On recovery failure:
+     - keep process alive,
+     - set `plain_eval_metric` to skipped with explicit error string.
+  3. Always write `train_eval_summary.json` for diagnosis.
+  4. Only create/save `trained_model/` when plaintext model is actually available.
+  5. Log explicit save skip reason:
+     - `[save] skip trained model export: plaintext model unavailable`
+
+### How To Read Result Correctly
+1. First check `train_eval_summary.json` under run `output_dir`.
+2. If `plain_eval_metric.reason == plain_model_recovery_failed`, export was skipped by design.
+3. Use logs to inspect root exception and decide whether to retry with updated script/environment.

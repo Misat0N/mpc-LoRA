@@ -1083,6 +1083,10 @@ def main():
         logger.info("[eval-private] skipped by flag --skip_private_eval")
 
     # Step 3B: recover a plaintext model and run plaintext evaluation.
+    plain_eval_metric = {"skipped": True, "reason": "disabled"}
+    plain_steps = 0
+    plain_skipped_by_len = 0
+    plain_recovery_error = None
     need_decrypt = (not args.skip_plain_eval) or (args.output_dir is not None)
     trained_model = None
     if need_decrypt:
@@ -1090,15 +1094,22 @@ def main():
         # Keep decrypted CrypTen parameters on CPU so to_pytorch() can assign storage safely.
         private_model = private_model.to("cpu")
     if rank == 0 and ((not args.skip_plain_eval) or (args.output_dir is not None)):
-        trained_model = _recover_plain_model_from_private(private_model, model, rank)
-        if not args.skip_plain_eval:
-            trained_model = trained_model.to(device)
-        trained_model.eval()
+        try:
+            trained_model = _recover_plain_model_from_private(private_model, model, rank)
+            if not args.skip_plain_eval:
+                trained_model = trained_model.to(device)
+            trained_model.eval()
+        except Exception as err:
+            plain_recovery_error = f"{type(err).__name__}: {err}"
+            logger.exception("[rank %s] recover_plain_model_failed: %s", rank, plain_recovery_error)
+            trained_model = None
+            plain_eval_metric = {
+                "skipped": True,
+                "reason": "plain_model_recovery_failed",
+                "error": plain_recovery_error,
+            }
 
-    plain_eval_metric = {"skipped": True, "reason": "disabled"}
-    plain_steps = 0
-    plain_skipped_by_len = 0
-    if rank == 0 and not args.skip_plain_eval:
+    if rank == 0 and not args.skip_plain_eval and trained_model is not None:
         plain_metric = evaluate.load("glue", args.task_name) if args.task_name is not None else evaluate.load("accuracy")
         for _, batch in enumerate(eval_dataloader):
             if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
@@ -1135,15 +1146,20 @@ def main():
             plain_skipped_by_len,
             plain_eval_metric,
         )
+    elif rank == 0 and not args.skip_plain_eval and trained_model is None:
+        logger.warning("[eval-plain] skipped: plaintext model unavailable (%s)", plain_recovery_error)
     elif rank == 0:
         logger.info("[eval-plain] skipped by flag --skip_plain_eval")
 
     if rank == 0 and args.output_dir is not None:
         trained_model_dir = os.path.join(args.output_dir, "trained_model")
-        os.makedirs(trained_model_dir, exist_ok=True)
         if trained_model is not None:
+            os.makedirs(trained_model_dir, exist_ok=True)
             trained_model.save_pretrained(trained_model_dir)
             tokenizer.save_pretrained(trained_model_dir)
+            logger.info("[save] trained model saved to %s", trained_model_dir)
+        else:
+            logger.warning("[save] skip trained model export: plaintext model unavailable")
 
         summary = {
             "train_steps": global_step,
@@ -1156,7 +1172,6 @@ def main():
         summary_path = os.path.join(args.output_dir, "train_eval_summary.json")
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
-        logger.info("[save] trained model saved to %s", trained_model_dir)
         logger.info("[save] summary saved to %s", summary_path)
 
     if rank == 0:

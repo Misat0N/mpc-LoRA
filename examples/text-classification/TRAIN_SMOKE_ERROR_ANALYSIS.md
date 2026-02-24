@@ -1,3 +1,102 @@
+# Train Smoke Error Analysis and Minimal Fix Record (English Version)
+
+## 1. Symptom
+
+Run:
+
+```bash
+./test_bert_base_128_comm_train_smoke.sh
+```
+
+Backward failed at step 2 (`step=001`). Key log lines:
+
+- `ERROR: [rank 0] step=001 backward_failed ... python_recursion_limit: 1000`
+- `loss_enc.backward()`
+- `Previous line repeated 969 more times`
+- `RecursionError: maximum recursion depth exceeded`
+
+Launcher finally reported:
+
+- `AssertionError: process 0 has non-zero exit code 1`
+
+## 2. Core Root Cause
+
+The root cause is that **CrypTen backward traverses the computation graph recursively in Python**. Under the current graph complexity, it hit the default recursion limit (1000), so `loss_enc.backward()` overflowed at `step=001`.
+
+This was not caused by path issues after directory migration. Evidence:
+
+- model, tokenizer, and checkpoints all loaded successfully;
+- both ranks completed forward (`step=000` produced loss);
+- failure consistently occurred in backward and the error type was `RecursionError`.
+
+The `cfg.debug` exception in logs was a secondary exception after recursion overflow, not the first cause.
+
+## 3. Minimal Fix Plan (Implemented)
+
+File: `examples/text-classification/run_glue_private_train_smoke.py`
+
+### Change A: Increase recursion limit (directly targets root cause)
+
+- Raise `sys.setrecursionlimit(...)` to at least `20000` after `main()` starts.
+- Print old/new limits for runtime verification.
+
+Purpose: prevent `loss_enc.backward()` from hitting Python's default recursion limit on deep graphs.
+
+### Change B: Unify train mode and optimizer initialization timing (reduce confounders)
+
+- Move `private_model.train()` and `optimizer = ct.optim.SGD(...)` before the training loop.
+- Remove logic that only switched to train / initialized optimizer after step0.
+
+Purpose: avoid step0/step1 behavior mismatch and reduce extra variables during diagnosis.
+
+### Change C: Avoid duplicate `ct.init()` (noise reduction)
+
+- If subprocess is already initialized by launcher, skip `ct.init()` and log a warning.
+
+Purpose: reduce "already initialized" noise without changing main logic.
+
+## 4. Why These Are "Minimal Necessary Changes"
+
+- Only changed control flow directly related to the crash.
+- Did not change model architecture, data, or loss function.
+- Prioritized "stable backward pass first" before accuracy or strategy tuning.
+- Kept existing diagnostic logging for further troubleshooting.
+
+## 5. Recommended Validation Steps
+
+1. Re-run smoke script and check whether it still crashes at `step=001 backward`.
+2. If it passes, gradually increase `max_steps` from `5` to `10/20` to verify stability.
+3. If it still fails, keep the current log and focus on:
+   - `python recursion limit old -> new`
+   - `loss_snapshot` and `cfg_snapshot` in `backward_failed`.
+
+## 6. Short Training + Evaluation After Upgrade (Step 2 + Step 3)
+
+`run_glue_private_train_smoke.py` is extended to:
+
+- short private training (using `train` split)
+- private evaluation after training (`validation`)
+- plaintext evaluation after training (`validation`)
+- export trained model to `output_dir/trained_model`
+- write summary to `output_dir/train_eval_summary.json`
+
+New key arguments:
+
+- `--per_device_train_batch_size`: training batch size
+- `--max_train_steps`: short-training steps
+- `--log_every_steps`: training log interval
+- `--eval_max_steps`: evaluation step limit (`-1` means full set)
+
+Recommended command (already in `test_bert_base_128_comm_train_smoke.sh`):
+
+```bash
+./test_bert_base_128_comm_train_smoke.sh
+```
+
+---
+
+# 中文翻译版（Chinese Translation）
+
 # Train Smoke 报错分析与最小修复记录
 
 ## 1. 问题现象

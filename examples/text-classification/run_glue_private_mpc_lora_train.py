@@ -194,7 +194,9 @@ class LoRALinear(nn.Module):
         self.r = int(r)
         self.alpha = int(alpha)
         self.scaling = float(alpha) / float(r) if r > 0 else 0.0
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        # Keep dropout as functional op to avoid introducing Identity modules that
+        # can break CrypTen -> PyTorch conversion for custom wrapped layers.
+        self.lora_dropout_p = float(dropout)
 
         for p in self.base.parameters():
             p.requires_grad = False
@@ -211,7 +213,8 @@ class LoRALinear(nn.Module):
     def forward(self, x):
         result = self.base(x)
         if self.r > 0:
-            lora_out = self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+            x_lora = F.dropout(x, p=self.lora_dropout_p, training=self.training) if self.lora_dropout_p > 0 else x
+            lora_out = self.lora_B(self.lora_A(x_lora)) * self.scaling
             result = result + lora_out
         return result
 
@@ -246,6 +249,60 @@ def _set_lora_trainable(model, train_classifier_head=True):
         if param.requires_grad:
             trainable.append(name)
     return trainable
+
+
+def _to_torch_state_value(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+
+    if hasattr(value, "get_plain_text"):
+        try:
+            plain = value.get_plain_text()
+            if torch.is_tensor(plain):
+                return plain.detach().cpu()
+        except Exception:
+            pass
+
+    data = getattr(value, "data", None)
+    if torch.is_tensor(data):
+        return data.detach().cpu()
+
+    return None
+
+
+def _recover_plain_model_from_private(private_model, template_model, rank):
+    # Preferred path: load decrypted CrypTen state into the original PyTorch template.
+    try:
+        ct_state = private_model.state_dict()
+    except Exception:
+        logger.exception("[rank %s] failed to read private_model.state_dict()", rank)
+        ct_state = None
+
+    if ct_state is not None:
+        converted = {}
+        for key, value in ct_state.items():
+            tensor_value = _to_torch_state_value(value)
+            if tensor_value is not None:
+                converted[key] = tensor_value
+
+        if converted:
+            load_result = template_model.load_state_dict(converted, strict=False)
+            matched_count = len(template_model.state_dict()) - len(load_result.missing_keys)
+            logger.info(
+                "[rank %s] recovered PyTorch model via state_dict: matched=%s missing=%s unexpected=%s",
+                rank,
+                matched_count,
+                len(load_result.missing_keys),
+                len(load_result.unexpected_keys),
+            )
+            if matched_count > 0:
+                return template_model
+            logger.warning("[rank %s] state_dict recovery matched 0 params, fallback to to_pytorch()", rank)
+        else:
+            logger.warning("[rank %s] state_dict recovery produced 0 tensor params, fallback to to_pytorch()", rank)
+
+    # Fallback path for compatibility.
+    return private_model.to_pytorch()
 
 
 def _install_print_filter():
@@ -1033,7 +1090,7 @@ def main():
         # Keep decrypted CrypTen parameters on CPU so to_pytorch() can assign storage safely.
         private_model = private_model.to("cpu")
     if rank == 0 and ((not args.skip_plain_eval) or (args.output_dir is not None)):
-        trained_model = private_model.to_pytorch()
+        trained_model = _recover_plain_model_from_private(private_model, model, rank)
         if not args.skip_plain_eval:
             trained_model = trained_model.to(device)
         trained_model.eval()

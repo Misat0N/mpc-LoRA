@@ -213,3 +213,65 @@
 2. Raise `--max_length` from `32` to `64`.
 3. Remove `--train_classifier_only` if full-model training is required.
 4. Re-enable eval by removing skip flags after train loop is stable.
+
+---
+
+## Follow-up Issue E (LoRA Run Crashes at `to_pytorch()`)
+- Command context:
+  - `test_bert_base_comm_mpc_lora_overnight.sh`
+- Crash point:
+  - `run_glue_private_mpc_lora_train.py:1036`
+  - `trained_model = private_model.to_pytorch()`
+- Error:
+  - `AttributeError: 'Identity' object has no attribute 'data'`
+- Process outcome:
+  - `AssertionError: process 0 has non-zero exit code 1`
+
+### Observed Facts
+- Distributed communicator startup completed normally.
+- Dataset loading and tokenization completed.
+- Failure happened after training/eval flow entered decrypt/export stage.
+- This is not the earlier warning noise (ONNX shape inference / deprecation warnings).
+
+### Root Cause Analysis
+- Current LoRA wrapper introduces `nn.Identity()` as a submodule (`self.dropout`) inside `LoRALinear`.
+- CrypTen `to_pytorch()` assumes submodules participating in its conversion path expose tensor-like `.data`.
+- During conversion, it visits a module path where `Identity` is treated like a tensor-bearing module, causing:
+  - `'Identity' object has no attribute 'data'`.
+
+### Immediate Workaround (Keep Run Alive)
+- Skip plaintext conversion/eval/export in overnight jobs:
+  - pass `--skip_plain_eval`
+  - avoid model export path that forces `to_pytorch()`
+- If only private metric is needed, keep:
+  - private training + private eval summary
+- Practical shell toggle:
+  - set `SKIP_PLAIN_EVAL=1` for overnight launch.
+
+### Recommended Code Fix (Minimal and Safe)
+1. In LoRA implementation, avoid registering `nn.Identity()` as module in the wrapped linear.
+2. Replace with a functional/no-op path, e.g.:
+   - keep `self.lora_dropout_p` (float) instead of `self.dropout = nn.Identity()`
+   - in forward: apply dropout only when `p > 0`, otherwise use input directly.
+3. Keep export guard:
+   - wrap `to_pytorch()` with try/except and do not crash whole run when plain export fails;
+   - still save `train_eval_summary.json` with explicit `"plain_eval_metric": {"skipped": true, "reason": "..."}`
+
+### Validation Checklist After Fix
+1. No `AttributeError: 'Identity' object has no attribute 'data'` in logs.
+2. End-of-run has either:
+   - saved plaintext model artifacts, or
+   - explicit plain-eval/export skipped reason without process crash.
+3. Final launcher exit code is 0.
+
+### Applied Root-Fix (Implemented)
+- File updated:
+  - `examples/text-classification/run_glue_private_mpc_lora_train.py`
+- Changes:
+  1. Removed `nn.Identity()` submodule from LoRA wrapper:
+     - replaced module-based no-op with functional dropout/no-op path.
+  2. Replaced fragile conversion path:
+     - previous: `trained_model = private_model.to_pytorch()`
+     - now: decrypt + recover via `state_dict` into original PyTorch template model.
+  3. Kept compatibility fallback:
+     - fallback to `to_pytorch()` only if `state_dict` recovery cannot match parameters.

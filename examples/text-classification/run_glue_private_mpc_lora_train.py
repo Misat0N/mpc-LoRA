@@ -270,6 +270,34 @@ def _to_torch_state_value(value):
     return None
 
 
+def _canonicalize_state_key(key):
+    # CrypTen modules may serialize keys with internal path markers.
+    # Normalize to standard PyTorch-style dotted names.
+    parts = [p for p in key.split(".") if p not in {"_modules", "_parameters", "_buffers"}]
+    if parts and parts[0] == "module":
+        parts = parts[1:]
+    return ".".join(parts)
+
+
+def _candidate_target_keys(raw_key):
+    cands = [raw_key]
+    canon = _canonicalize_state_key(raw_key)
+    if canon and canon not in cands:
+        cands.append(canon)
+    if raw_key.startswith("module."):
+        cands.append(raw_key[len("module."):])
+    if canon.startswith("module."):
+        cands.append(canon[len("module."):])
+    # Deduplicate while preserving order
+    uniq = []
+    seen = set()
+    for k in cands:
+        if k and k not in seen:
+            uniq.append(k)
+            seen.add(k)
+    return uniq
+
+
 def _recover_plain_model_from_private(private_model, template_model, rank):
     # Preferred path: load decrypted CrypTen state into the original PyTorch template.
     try:
@@ -278,31 +306,49 @@ def _recover_plain_model_from_private(private_model, template_model, rank):
         logger.exception("[rank %s] failed to read private_model.state_dict()", rank)
         ct_state = None
 
-    if ct_state is not None:
-        converted = {}
-        for key, value in ct_state.items():
-            tensor_value = _to_torch_state_value(value)
-            if tensor_value is not None:
-                converted[key] = tensor_value
+    if ct_state is None:
+        raise RuntimeError("state_dict_unavailable")
 
-        if converted:
-            load_result = template_model.load_state_dict(converted, strict=False)
-            matched_count = len(template_model.state_dict()) - len(load_result.missing_keys)
-            logger.info(
-                "[rank %s] recovered PyTorch model via state_dict: matched=%s missing=%s unexpected=%s",
-                rank,
-                matched_count,
-                len(load_result.missing_keys),
-                len(load_result.unexpected_keys),
-            )
-            if matched_count > 0:
-                return template_model
-            logger.warning("[rank %s] state_dict recovery matched 0 params, fallback to to_pytorch()", rank)
-        else:
-            logger.warning("[rank %s] state_dict recovery produced 0 tensor params, fallback to to_pytorch()", rank)
+    template_state = template_model.state_dict()
+    template_keys = set(template_state.keys())
+    mapped = {}
 
-    # Fallback path for compatibility.
-    return private_model.to_pytorch()
+    for raw_key, raw_value in ct_state.items():
+        tensor_value = _to_torch_state_value(raw_value)
+        if tensor_value is None:
+            continue
+
+        target_key = None
+        for cand in _candidate_target_keys(raw_key):
+            if cand in template_keys:
+                target_key = cand
+                break
+
+        if target_key is None:
+            continue
+
+        target_tensor = template_state[target_key]
+        if tuple(target_tensor.shape) != tuple(tensor_value.shape):
+            continue
+
+        mapped[target_key] = tensor_value.to(dtype=target_tensor.dtype)
+
+    if not mapped:
+        sample_keys = list(ct_state.keys())[:10]
+        logger.error("[rank %s] state_dict recovery mapped 0 params. sample_ct_keys=%s", rank, sample_keys)
+        raise RuntimeError("state_dict_recovery_no_match")
+
+    updated_state = dict(template_state)
+    updated_state.update(mapped)
+    load_result = template_model.load_state_dict(updated_state, strict=False)
+    logger.info(
+        "[rank %s] recovered PyTorch model via state_dict: mapped=%s missing=%s unexpected=%s",
+        rank,
+        len(mapped),
+        len(load_result.missing_keys),
+        len(load_result.unexpected_keys),
+    )
+    return template_model
 
 
 def _install_print_filter():

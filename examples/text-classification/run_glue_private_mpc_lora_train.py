@@ -251,7 +251,14 @@ def _set_lora_trainable(model, train_classifier_head=True):
     return trainable
 
 
-def _to_torch_state_value(value):
+def _to_torch_state_value(value, _seen=None):
+    if _seen is None:
+        _seen = set()
+    obj_id = id(value)
+    if obj_id in _seen:
+        return None
+    _seen.add(obj_id)
+
     if torch.is_tensor(value):
         return value.detach().cpu()
 
@@ -263,29 +270,48 @@ def _to_torch_state_value(value):
         except Exception:
             pass
 
-    data = getattr(value, "data", None)
-    if torch.is_tensor(data):
-        return data.detach().cpu()
+    for attr_name in ("data", "_tensor", "share"):
+        child = getattr(value, attr_name, None)
+        if child is not None and child is not value:
+            child_tensor = _to_torch_state_value(child, _seen=_seen)
+            if child_tensor is not None:
+                return child_tensor
 
     return None
+
+
+def _strip_state_key_suffixes(key):
+    suffixes = (".data", "._tensor", ".share")
+    changed = True
+    while changed and key:
+        changed = False
+        for suffix in suffixes:
+            if key.endswith(suffix):
+                key = key[: -len(suffix)]
+                changed = True
+    return key
 
 
 def _canonicalize_state_key(key):
     # CrypTen modules may serialize keys with internal path markers.
     # Normalize to standard PyTorch-style dotted names.
+    key = _strip_state_key_suffixes(key)
     parts = [p for p in key.split(".") if p not in {"_modules", "_parameters", "_buffers"}]
     if parts and parts[0] == "module":
         parts = parts[1:]
-    return ".".join(parts)
+    return _strip_state_key_suffixes(".".join(parts))
 
 
 def _candidate_target_keys(raw_key):
-    cands = [raw_key]
+    stripped_raw = _strip_state_key_suffixes(raw_key)
+    cands = [raw_key, stripped_raw]
     canon = _canonicalize_state_key(raw_key)
     if canon and canon not in cands:
         cands.append(canon)
     if raw_key.startswith("module."):
         cands.append(raw_key[len("module."):])
+    if stripped_raw.startswith("module."):
+        cands.append(stripped_raw[len("module."):])
     if canon.startswith("module."):
         cands.append(canon[len("module."):])
     # Deduplicate while preserving order

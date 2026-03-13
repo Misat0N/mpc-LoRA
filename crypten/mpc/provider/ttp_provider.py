@@ -17,6 +17,7 @@ from crypten.common.util import count_wraps
 from crypten.encoder import FixedPointEncoder
 from crypten.mpc.mpc import MPCTensor
 from crypten.mpc.primitives import ArithmeticSharedTensor, BinarySharedTensor
+from crypten.mpc.primitives.beaver_reuse import increment_perf_counter
 
 from .provider import TupleProvider
 
@@ -29,6 +30,7 @@ class TrustedThirdParty(TupleProvider):
 
     def generate_additive_triple(self, size0, size1, op, device=None, *args, **kwargs):
         """Generate multiplicative triples of given sizes"""
+        increment_perf_counter("triple_generate_calls")
         generator = TTPClient.get().get_generator(device=device)
 
         a = generate_random_ring_element(size0, generator=generator, device=device)

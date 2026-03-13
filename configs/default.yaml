@@ -71,6 +71,13 @@ mpc:
   active_security: False
   provider: "TFP"
   protocol: "beaver"
+  # INSECURE PERFORMANCE EXPERIMENT:
+  # reuse Beaver masks (A / optional B) to measure pure performance impact.
+  experimental_reuse_mask: False
+  reuse_mode: "FIX_A"
+  reuse_scope: "STEP"
+  reuse_op_types: ["matmul"]
+  reuse_tagging: True
 nn:
   dpsmpc:
     protocol: "layer_estimation"

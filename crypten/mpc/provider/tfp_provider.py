@@ -14,6 +14,7 @@ import torch
 from crypten.common.rng import generate_kbit_random_tensor, generate_random_ring_element, generate_unsigned_random_ring_element
 from crypten.common.util import count_wraps, torch_stack
 from crypten.mpc.primitives import ArithmeticSharedTensor, BinarySharedTensor
+from crypten.mpc.primitives.beaver_reuse import increment_perf_counter
 
 from .provider import TupleProvider
 
@@ -23,6 +24,7 @@ class TrustedFirstParty(TupleProvider):
 
     def generate_additive_triple(self, size0, size1, op, device=None, *args, **kwargs):
         """Generate multiplicative triples of given sizes"""
+        increment_perf_counter("triple_generate_calls")
         a = generate_random_ring_element(size0, device=device)
         b = generate_random_ring_element(size1, device=device)
 

@@ -12,6 +12,12 @@ from functools import reduce
 import crypten
 import torch
 
+from .common.reuse_context import (
+    get_current_layer_tag,
+    get_current_reuse_step,
+    next_beaver_op_uid,
+    use_beaver_tag,
+)
 from .common.util import _grad_input_padding
 
 
@@ -732,13 +738,41 @@ class AutogradMul(AutogradFunction):
 @register_function("matmul")
 class AutogradMatMul(AutogradFunction):
     @staticmethod
+    def _build_beaver_tag(base_tag, pass_name, left, right, **extra_fields):
+        if base_tag is None:
+            return None
+        tag = dict(base_tag)
+        tag["pass_name"] = pass_name
+        tag["tensor_shapes_signature"] = (tuple(left.size()), tuple(right.size()))
+        for key, value in extra_fields.items():
+            if value is not None:
+                tag[key] = value
+        return tag
+
+    @staticmethod
     def forward(ctx, input, other):
+        layer_tag = get_current_layer_tag()
+        if layer_tag is None:
+            layer_tag = "global"
+        base_tag = {
+            "step_id": get_current_reuse_step(default=None),
+            "layer_id": layer_tag,
+            "op_name": "matmul",
+            "op_uid": next_beaver_op_uid(),
+        }
+        forward_tag = AutogradMatMul._build_beaver_tag(
+            base_tag, "forward", input, other
+        )
+        ctx.matmul_base_tag = base_tag
+        ctx.matmul_forward_tag = forward_tag
         ctx.save_multiple_for_backward([input, other])
-        return input.matmul(other)
+        with use_beaver_tag(forward_tag):
+            return input.matmul(other)
 
     @staticmethod
     def backward(ctx, grad_output):
         self_, other = ctx.saved_tensors
+        base_tag = getattr(ctx, "matmul_base_tag", None)
 
         # Cache sizes for inverse_broadcast
         self_size = self_.size()
@@ -755,8 +789,49 @@ class AutogradMatMul(AutogradFunction):
             grad_output = grad_output.unsqueeze(1)
 
         # Compute gradients
-        self_grad = grad_output.matmul(other.transpose(-2, -1))
-        other_grad = self_.transpose(-2, -1).matmul(grad_output)
+        grad_input_right = other.transpose(-2, -1)
+        grad_weight_left = self_.transpose(-2, -1)
+        forward_anchor_a = {"pass_name": "forward", "operand": "a", "transform": "transpose"}
+        forward_anchor_eps = {
+            "pass_name": "forward",
+            "residual": "epsilon",
+            "transform": "transpose",
+        }
+        grad_input_tag = AutogradMatMul._build_beaver_tag(
+            base_tag, "backward_dX", grad_output, grad_input_right
+        )
+        grad_weight_tag = AutogradMatMul._build_beaver_tag(
+            base_tag,
+            "backward_dW",
+            grad_weight_left,
+            grad_output,
+            a_anchor=forward_anchor_a,
+            epsilon_anchor=forward_anchor_eps,
+        )
+        reuse_mode = str(getattr(crypten.cfg.mpc, "reuse_mode", "FIX_A")).upper()
+        if grad_input_tag is not None and reuse_mode in {"FIX_A", "FIX_AB"}:
+            grad_input_tag["b_anchor"] = {
+                "pass_name": "forward",
+                "operand": "b",
+                "transform": "transpose",
+            }
+            grad_input_tag["delta_anchor"] = {
+                "pass_name": "forward",
+                "residual": "delta",
+                "transform": "transpose",
+            }
+
+        if grad_input_tag is None:
+            self_grad = grad_output.matmul(grad_input_right)
+        else:
+            with use_beaver_tag(grad_input_tag):
+                self_grad = grad_output.matmul(grad_input_right)
+
+        if grad_weight_tag is None:
+            other_grad = grad_weight_left.matmul(grad_output)
+        else:
+            with use_beaver_tag(grad_weight_tag):
+                other_grad = grad_weight_left.matmul(grad_output)
 
         # Fix gradient sizes for vector inputs
         if len(self_size) < 2:

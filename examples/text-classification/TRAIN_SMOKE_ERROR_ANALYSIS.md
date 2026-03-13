@@ -93,6 +93,77 @@ Recommended command (already in `test_bert_base_128_comm_train_smoke.sh`):
 ./test_bert_base_128_comm_train_smoke.sh
 ```
 
+## 7. Representative Logs and Related Code
+
+### 7.1 Representative Crash Log
+
+```text
+ERROR:__mp_main__:[rank 0] step=001 backward_failed cfg={'top_level_keys': [...], 'precision_bits': 16, 'validation_mode': False} loss={'loss_type': 'MPCTensor', 'loss_shape': (), 'python_recursion_limit': 1000, 'grad_fn': 'type', 'children_len': 1}
+Traceback (most recent call last):
+  File ".../run_glue_private_train_smoke.py", line 579, in main
+    loss_enc.backward()
+  File ".../crypten/cryptensor.py", line 268, in backward
+    child.backward(grad_input=grad[idx], top_node=False)
+  [Previous line repeated 969 more times]
+RecursionError: maximum recursion depth exceeded
+AssertionError: process 0 has non-zero exit code 1
+```
+
+This log proves the failure was inside recursive backward traversal, not model loading or dataset preparation.
+
+### 7.2 Related Code Snippet: Raise Recursion Limit Early
+
+File reference:
+- `examples/text-classification/run_glue_private_train_smoke.py:264`
+
+```python
+old_recursion_limit = sys.getrecursionlimit()
+target_recursion_limit = max(old_recursion_limit, 20000)
+if target_recursion_limit != old_recursion_limit:
+    sys.setrecursionlimit(target_recursion_limit)
+logger.info("python recursion limit %s -> %s", old_recursion_limit, sys.getrecursionlimit())
+```
+
+This change directly targets the overflow shown in the crash log.
+
+### 7.3 Related Code Snippet: Stabilize Train Setup Before Loop
+
+File references:
+- `examples/text-classification/run_glue_private_train_smoke.py:451`
+- `examples/text-classification/run_glue_private_train_smoke.py:453`
+
+```python
+dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
+private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).encrypt().to(device)
+private_model.train()
+lr = 0.01
+optimizer = ct.optim.SGD(private_model.parameters(), lr=lr)
+```
+
+This ensures step 0 and step 1 run under the same model mode and optimizer lifecycle.
+
+### 7.4 Related Code Snippet: Backward Failure Capture
+
+File reference:
+- `examples/text-classification/run_glue_private_train_smoke.py:579`
+
+```python
+logger.info("[rank %s] step=%03d backward_start", rank, step)
+try:
+    loss_enc.backward()
+except Exception:
+    logger.exception(
+        "[rank %s] step=%03d backward_failed cfg=%s loss=%s",
+        rank,
+        step,
+        _cfg_snapshot(),
+        _loss_snapshot(loss_enc),
+    )
+    raise
+```
+
+This is why the crash log includes `cfg` and `loss_snapshot`, which are the most useful fields when diagnosing deep-graph backward failures.
+
 ---
 
 # 中文翻译版（Chinese Translation）
@@ -190,3 +261,74 @@ Recommended command (already in `test_bert_base_128_comm_train_smoke.sh`):
 ```bash
 ./test_bert_base_128_comm_train_smoke.sh
 ```
+
+## 7. 代表性日志与相关代码
+
+### 7.1 代表性报错日志
+
+```text
+ERROR:__mp_main__:[rank 0] step=001 backward_failed cfg={'top_level_keys': [...], 'precision_bits': 16, 'validation_mode': False} loss={'loss_type': 'MPCTensor', 'loss_shape': (), 'python_recursion_limit': 1000, 'grad_fn': 'type', 'children_len': 1}
+Traceback (most recent call last):
+  File ".../run_glue_private_train_smoke.py", line 579, in main
+    loss_enc.backward()
+  File ".../crypten/cryptensor.py", line 268, in backward
+    child.backward(grad_input=grad[idx], top_node=False)
+  [Previous line repeated 969 more times]
+RecursionError: maximum recursion depth exceeded
+AssertionError: process 0 has non-zero exit code 1
+```
+
+这段日志说明失败发生在递归 backward 内部，而不是数据集加载或模型加载阶段。
+
+### 7.2 相关代码片段：一开始就提高递归上限
+
+文件位置：
+- `examples/text-classification/run_glue_private_train_smoke.py:264`
+
+```python
+old_recursion_limit = sys.getrecursionlimit()
+target_recursion_limit = max(old_recursion_limit, 20000)
+if target_recursion_limit != old_recursion_limit:
+    sys.setrecursionlimit(target_recursion_limit)
+logger.info("python recursion limit %s -> %s", old_recursion_limit, sys.getrecursionlimit())
+```
+
+这段修改直接对应报错日志中的 `python_recursion_limit: 1000`。
+
+### 7.3 相关代码片段：在训练循环前固定训练模式和优化器
+
+文件位置：
+- `examples/text-classification/run_glue_private_train_smoke.py:451`
+- `examples/text-classification/run_glue_private_train_smoke.py:453`
+
+```python
+dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
+private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).encrypt().to(device)
+private_model.train()
+lr = 0.01
+optimizer = ct.optim.SGD(private_model.parameters(), lr=lr)
+```
+
+这样做的作用是让 step0 和 step1 处在同一套训练状态下，减少额外干扰变量。
+
+### 7.4 相关代码片段：backward 失败时的日志包装
+
+文件位置：
+- `examples/text-classification/run_glue_private_train_smoke.py:579`
+
+```python
+logger.info("[rank %s] step=%03d backward_start", rank, step)
+try:
+    loss_enc.backward()
+except Exception:
+    logger.exception(
+        "[rank %s] step=%03d backward_failed cfg=%s loss=%s",
+        rank,
+        step,
+        _cfg_snapshot(),
+        _loss_snapshot(loss_enc),
+    )
+    raise
+```
+
+这就是为什么日志里会带出 `cfg` 和 `loss_snapshot`，也是后续排查深图 backward 问题最关键的上下文。

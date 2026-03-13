@@ -16,6 +16,7 @@ import crypten
 import torch
 import torch.onnx.symbolic_helper as sym_help
 from crypten.common.functions.pooling import _adaptive_pool2d_helper
+from crypten.common.reuse_context import use_layer_tag
 from crypten.config import cfg
 
 class Module:
@@ -2072,7 +2073,9 @@ class Linear(Module):
             self.register_parameter("bias", pytorch_module.bias)
 
     def forward(self, x):
-        output = x.matmul(self.weight.t())
+        layer_tag = f"linear:{id(self)}"
+        with use_layer_tag(layer_tag):
+            output = x.matmul(self.weight.t())
         if hasattr(self, "bias"):
             output = output.add(self.bias)
         return output

@@ -8,8 +8,15 @@
 import crypten
 import crypten.communicator as comm
 import torch
+from crypten.common.reuse_context import get_current_beaver_tag
 from crypten.common.util import count_wraps
 from crypten.config import cfg
+from crypten.mpc.primitives.beaver_reuse import (
+    get_beaver_reuse_cache,
+    get_perf_counters,
+    increment_perf_counter,
+    reset_perf_counters,
+)
 
 
 class IgnoreEncodings:
@@ -28,31 +35,68 @@ class IgnoreEncodings:
             tensor.encoder._scale = self.encodings_cache[i]
 
 
-def __beaver_protocol(op, x, y, *args, **kwargs):
-    """Performs Beaver protocol for additively secret-shared tensors x and y
+def _reuse_enabled_for_op(op):
+    if not getattr(cfg.mpc, "experimental_reuse_mask", False):
+        return False
+    reuse_ops = getattr(cfg.mpc, "reuse_op_types", ["matmul"])
+    if isinstance(reuse_ops, str):
+        reuse_ops = [reuse_ops]
+    return op in set(str(item) for item in reuse_ops)
 
-    1. Obtain uniformly random sharings [a],[b] and [c] = [a * b]
-    2. Additively hide [x] and [y] with appropriately sized [a] and [b]
-    3. Open ([epsilon] = [x] - [a]) and ([delta] = [y] - [b])
-    4. Return [z] = [c] + (epsilon * [b]) + ([a] * delta) + (epsilon * delta)
-    """
-    assert op in {
-        "mul",
-        "matmul",
-        "conv1d",
-        "conv2d",
-        "conv_transpose1d",
-        "conv_transpose2d",
+
+def _normalize_beaver_tag(op, x, y):
+    if not getattr(cfg.mpc, "reuse_tagging", True):
+        return None
+    tag = get_current_beaver_tag()
+    if isinstance(tag, dict):
+        return tag
+    return {
+        "step_id": None,
+        "layer_id": "untagged",
+        "op_name": op,
+        "pass_name": "untagged",
+        "op_uid": id(x) ^ id(y),
+        "tensor_shapes_signature": (tuple(x.size()), tuple(y.size())),
     }
-    if x.device != y.device:
-        raise ValueError(f"x lives on device {x.device} but y on device {y.device}")
+
+
+def _open_missing_residuals(x, y, a, b, epsilon, delta):
+    from .arithmetic import ArithmeticSharedTensor
+
+    missing = []
+    names = []
+    if epsilon is None:
+        missing.append(x - a)
+        names.append("epsilon")
+    if delta is None:
+        missing.append(y - b)
+        names.append("delta")
+
+    if len(missing) == 0:
+        return epsilon, delta
+
+    with IgnoreEncodings([a, b, x, y]):
+        opened = ArithmeticSharedTensor.reveal_batch(missing)
+    increment_perf_counter("beaver_reveal_calls")
+    increment_perf_counter("beaver_revealed_tensors", len(missing))
+    if not isinstance(opened, (list, tuple)):
+        opened = [opened]
+
+    for idx, name in enumerate(names):
+        if name == "epsilon":
+            epsilon = opened[idx]
+        else:
+            delta = opened[idx]
+    return epsilon, delta
+
+
+def _beaver_from_provider(op, x, y, *args, **kwargs):
+    from .arithmetic import ArithmeticSharedTensor
 
     provider = crypten.mpc.get_default_provider()
     a, b, c = provider.generate_additive_triple(
         x.size(), y.size(), op, device=x.device, *args, **kwargs
     )
-
-    from .arithmetic import ArithmeticSharedTensor
 
     if cfg.mpc.active_security:
         """
@@ -74,16 +118,80 @@ def __beaver_protocol(op, x, y, *args, **kwargs):
         if torch.any(triples_check != 0):
             raise ValueError("Beaver Triples verification failed!")
 
-    # Vectorized reveal to reduce rounds of communication
     with IgnoreEncodings([a, b, x, y]):
         epsilon, delta = ArithmeticSharedTensor.reveal_batch([x - a, y - b])
+    increment_perf_counter("beaver_reveal_calls")
+    increment_perf_counter("beaver_revealed_tensors", 2)
 
-    # z = c + (a * delta) + (epsilon * b) + epsilon * delta
     c._tensor += getattr(torch, op)(epsilon, b._tensor, *args, **kwargs)
     c._tensor += getattr(torch, op)(a._tensor, delta, *args, **kwargs)
     c += getattr(torch, op)(epsilon, delta, *args, **kwargs)
-
     return c
+
+
+def _beaver_with_reuse(op, x, y, *args, **kwargs):
+    tag = _normalize_beaver_tag(op, x, y)
+    reuse_cache = get_beaver_reuse_cache()
+    reuse_mode = str(getattr(cfg.mpc, "reuse_mode", "FIX_A")).upper()
+
+    a = reuse_cache.get_or_create_A(x.size(), x.share.dtype, x.device, tag)
+    if reuse_mode == "FIX_AB":
+        b = reuse_cache.get_or_create_B(y.size(), y.share.dtype, y.device, tag)
+        cache_c = True
+    elif reuse_mode == "FIX_A":
+        if isinstance(tag, dict) and tag.get("b_anchor") is not None:
+            b = reuse_cache.get_or_create_B(y.size(), y.share.dtype, y.device, tag)
+            cache_c = True
+        else:
+            b = reuse_cache.create_fresh_B(y.size(), y.share.dtype, y.device)
+            cache_c = False
+    else:
+        raise ValueError(f"Unknown cfg.mpc.reuse_mode `{reuse_mode}`")
+
+    c = reuse_cache.get_or_create_C_for_op(
+        a, b, op, args=args, kwargs=kwargs, tag=tag, cache_result=cache_c
+    )
+
+    epsilon = None
+    delta = None
+    if isinstance(tag, dict):
+        epsilon, delta = reuse_cache.get_opened_residual(tag)
+        if epsilon is None:
+            epsilon = reuse_cache.get_opened_residual_from_anchor(
+                tag, residual_name="epsilon", expected_shape=x.size()
+            )
+        if delta is None:
+            delta = reuse_cache.get_opened_residual_from_anchor(
+                tag, residual_name="delta", expected_shape=y.size()
+            )
+
+    epsilon, delta = _open_missing_residuals(x, y, a, b, epsilon, delta)
+
+    if isinstance(tag, dict):
+        reuse_cache.cache_opened_residual(tag, E_pub=epsilon, F_pub=delta)
+
+    c._tensor += getattr(torch, op)(epsilon, b._tensor, *args, **kwargs)
+    c._tensor += getattr(torch, op)(a._tensor, delta, *args, **kwargs)
+    c += getattr(torch, op)(epsilon, delta, *args, **kwargs)
+    return c
+
+
+def __beaver_protocol(op, x, y, *args, **kwargs):
+    """Performs Beaver protocol for additively secret-shared tensors x and y."""
+    assert op in {
+        "mul",
+        "matmul",
+        "conv1d",
+        "conv2d",
+        "conv_transpose1d",
+        "conv_transpose2d",
+    }
+    if x.device != y.device:
+        raise ValueError(f"x lives on device {x.device} but y on device {y.device}")
+
+    if _reuse_enabled_for_op(op):
+        return _beaver_with_reuse(op, x, y, *args, **kwargs)
+    return _beaver_from_provider(op, x, y, *args, **kwargs)
 
 
 def mul(x, y):
@@ -108,6 +216,24 @@ def conv_transpose1d(x, y, **kwargs):
 
 def conv_transpose2d(x, y, **kwargs):
     return __beaver_protocol("conv_transpose2d", x, y, **kwargs)
+
+
+def begin_reuse_step(step_id):
+    get_beaver_reuse_cache().begin_step(step_id)
+
+
+def end_reuse_step(step_id=None):
+    get_beaver_reuse_cache().end_step(step_id)
+
+
+def reset_reuse_stats(reset_cache=False):
+    reset_perf_counters()
+    if reset_cache:
+        get_beaver_reuse_cache().clear()
+
+
+def get_reuse_stats():
+    return get_perf_counters()
 
 
 def square(x):

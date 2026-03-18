@@ -809,7 +809,7 @@ class AutogradMatMul(AutogradFunction):
             epsilon_anchor=forward_anchor_eps,
         )
         reuse_mode = str(getattr(crypten.cfg.mpc, "reuse_mode", "FIX_A")).upper()
-        if grad_input_tag is not None and reuse_mode in {"FIX_A", "FIX_AB"}:
+        if grad_input_tag is not None and reuse_mode == "FIX_AB":
             grad_input_tag["b_anchor"] = {
                 "pass_name": "forward",
                 "operand": "b",

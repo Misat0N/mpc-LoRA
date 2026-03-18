@@ -119,6 +119,11 @@ def _relative_change(current, baseline):
     return float((current - baseline) / baseline)
 
 
+def _synchronize_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _configure_mode(experimental_reuse_mask, reuse_mode):
     cfg.mpc.experimental_reuse_mask = experimental_reuse_mask
     cfg.mpc.reuse_mode = reuse_mode
@@ -199,6 +204,15 @@ def _empty_metric_lists():
         "beaver_reveal_calls": [],
         "beaver_revealed_tensors": [],
         "triple_generate_calls": [],
+        "a_cache_hit": [],
+        "a_cache_miss": [],
+        "b_cache_hit": [],
+        "b_cache_miss": [],
+        "b_fresh_generated": [],
+        "c_cache_hit": [],
+        "c_cache_miss": [],
+        "residual_anchor_hit": [],
+        "residual_anchor_miss": [],
     }
 
 
@@ -219,24 +233,29 @@ def _run_mode(args, case, mode_name, experimental_reuse_mask, reuse_mode, device
         beaver_before = beaver.get_reuse_stats()
 
         try:
+            _synchronize_device(device)
             step_start = time.perf_counter()
             prep_start = step_start
             x_enc = crypten.cryptensor(x_plain, src=0, requires_grad=True)
             y_enc = crypten.cryptensor(y_plain, src=0, requires_grad=False)
             optimizer.zero_grad()
+            _synchronize_device(device)
             prep_end = time.perf_counter()
 
             forward_start = prep_end
             output = model(x_enc)
             loss = criterion(output, y_enc)
+            _synchronize_device(device)
             forward_end = time.perf_counter()
 
             backward_start = forward_end
             loss.backward()
+            _synchronize_device(device)
             backward_end = time.perf_counter()
 
             optim_start = backward_end
             optimizer.step()
+            _synchronize_device(device)
             step_end = time.perf_counter()
 
             comm_after = crypten.get_communication_stats()
@@ -263,6 +282,15 @@ def _run_mode(args, case, mode_name, experimental_reuse_mask, reuse_mode, device
             beaver_delta.get("beaver_revealed_tensors", 0)
         )
         metrics["triple_generate_calls"].append(beaver_delta.get("triple_generate_calls", 0))
+        metrics["a_cache_hit"].append(beaver_delta.get("a_cache_hit", 0))
+        metrics["a_cache_miss"].append(beaver_delta.get("a_cache_miss", 0))
+        metrics["b_cache_hit"].append(beaver_delta.get("b_cache_hit", 0))
+        metrics["b_cache_miss"].append(beaver_delta.get("b_cache_miss", 0))
+        metrics["b_fresh_generated"].append(beaver_delta.get("b_fresh_generated", 0))
+        metrics["c_cache_hit"].append(beaver_delta.get("c_cache_hit", 0))
+        metrics["c_cache_miss"].append(beaver_delta.get("c_cache_miss", 0))
+        metrics["residual_anchor_hit"].append(beaver_delta.get("residual_anchor_hit", 0))
+        metrics["residual_anchor_miss"].append(beaver_delta.get("residual_anchor_miss", 0))
 
     result = {
         "mode": mode_name,
@@ -299,6 +327,15 @@ def _average_mode_runs(mode_runs):
         "beaver_reveal_calls",
         "beaver_revealed_tensors",
         "triple_generate_calls",
+        "a_cache_hit",
+        "a_cache_miss",
+        "b_cache_hit",
+        "b_cache_miss",
+        "b_fresh_generated",
+        "c_cache_hit",
+        "c_cache_miss",
+        "residual_anchor_hit",
+        "residual_anchor_miss",
     ]
     for key in numeric_keys:
         summary[key] = _mean([run[key] for run in mode_runs])
@@ -464,6 +501,20 @@ def _print_case_summary(case_result):
             f"triple={comparison['triple_reduction_pct']:.2f}% | "
             f"reveal_tensors={comparison['reveal_tensor_reduction_pct']:.2f}%"
         )
+    print("Cache counters per step:")
+    print("        mode | a_hit/miss | b_hit/miss | b_fresh | c_hit/miss | anchor_hit/miss")
+    for mode in mode_order:
+        if mode not in case_result["summary"]:
+            continue
+        item = case_result["summary"][mode]
+        print(
+            f"{mode:>12} | "
+            f"{item['a_cache_hit']:.2f}/{item['a_cache_miss']:.2f} | "
+            f"{item['b_cache_hit']:.2f}/{item['b_cache_miss']:.2f} | "
+            f"{item['b_fresh_generated']:.2f} | "
+            f"{item['c_cache_hit']:.2f}/{item['c_cache_miss']:.2f} | "
+            f"{item['residual_anchor_hit']:.2f}/{item['residual_anchor_miss']:.2f}"
+        )
 
 
 def _build_csv_rows(rank0_payload):
@@ -492,6 +543,15 @@ def _build_csv_rows(rank0_payload):
                 "beaver_reveal_calls": item["beaver_reveal_calls"],
                 "beaver_revealed_tensors": item["beaver_revealed_tensors"],
                 "triple_generate_calls": item["triple_generate_calls"],
+                "a_cache_hit": item["a_cache_hit"],
+                "a_cache_miss": item["a_cache_miss"],
+                "b_cache_hit": item["b_cache_hit"],
+                "b_cache_miss": item["b_cache_miss"],
+                "b_fresh_generated": item["b_fresh_generated"],
+                "c_cache_hit": item["c_cache_hit"],
+                "c_cache_miss": item["c_cache_miss"],
+                "residual_anchor_hit": item["residual_anchor_hit"],
+                "residual_anchor_miss": item["residual_anchor_miss"],
                 "speedup_vs_baseline": comparisons.get(mode_name, {}).get(
                     "speedup_vs_baseline", 1.0
                 ),

@@ -139,12 +139,8 @@ def _beaver_with_reuse(op, x, y, *args, **kwargs):
         b = reuse_cache.get_or_create_B(y.size(), y.share.dtype, y.device, tag)
         cache_c = True
     elif reuse_mode == "FIX_A":
-        if isinstance(tag, dict) and tag.get("b_anchor") is not None:
-            b = reuse_cache.get_or_create_B(y.size(), y.share.dtype, y.device, tag)
-            cache_c = True
-        else:
-            b = reuse_cache.create_fresh_B(y.size(), y.share.dtype, y.device)
-            cache_c = False
+        b = reuse_cache.create_fresh_B(y.size(), y.share.dtype, y.device)
+        cache_c = False
     else:
         raise ValueError(f"Unknown cfg.mpc.reuse_mode `{reuse_mode}`")
 

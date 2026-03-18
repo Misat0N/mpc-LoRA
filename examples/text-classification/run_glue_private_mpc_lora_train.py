@@ -175,6 +175,15 @@ def _new_reuse_runtime_profile():
         "triple_generate_calls": [],
         "beaver_reveal_calls": [],
         "beaver_revealed_tensors": [],
+        "a_cache_hit": [],
+        "a_cache_miss": [],
+        "b_cache_hit": [],
+        "b_cache_miss": [],
+        "b_fresh_generated": [],
+        "c_cache_hit": [],
+        "c_cache_miss": [],
+        "residual_anchor_hit": [],
+        "residual_anchor_miss": [],
     }
 
 
@@ -190,6 +199,23 @@ def _configure_reuse_experiment(args):
     cfg.mpc.reuse_tagging = True
     if args.reuse_profile:
         cfg.communicator.verbose = True
+
+
+def _synchronize_timing_device(device):
+    if isinstance(device, torch.device):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return
+    if isinstance(device, str):
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        return
+    try:
+        device_type = getattr(device, "type", None)
+    except Exception:
+        device_type = None
+    if device_type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _safe_metric_compute(metric, steps, rank, phase):
@@ -1118,18 +1144,21 @@ def main():
             beaver_protocol.begin_reuse_step(step_id)
         comm_before = ct.get_communication_stats() if args.reuse_profile else None
         beaver_before = beaver_protocol.get_reuse_stats() if args.reuse_profile else None
+        _synchronize_timing_device(device)
         step_start = time.perf_counter()
         prep_start = step_start
         inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
         attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
         token_type_enc = ct.cryptensor(token_type_ids).to(device)
         optimizer.zero_grad()
+        _synchronize_timing_device(device)
         prep_end = time.perf_counter()
 
         # forward (NO ct.no_grad for training)
         # 在不设置ct.no_grad时自动默认训练模式，forward过程会记录backward所需结果
         forward_start = prep_end
         logits_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)  # [B, num_labels]
+        _synchronize_timing_device(device)
         forward_end = time.perf_counter()
         logger.info(
             "[rank %s] train_step=%03d forward_done dt=%.3fs logits_shape=%s",
@@ -1181,6 +1210,7 @@ def main():
                 _loss_snapshot(loss_enc),
             )
             raise
+        _synchronize_timing_device(device)
         backward_end = time.perf_counter()
         logger.info("[rank %s] train_step=%03d backward_done", rank, global_step)
 
@@ -1193,11 +1223,13 @@ def main():
                 clear_current_reuse_step()
             logger.exception("[rank %s] train_step=%03d optimizer_step_failed", rank, global_step)
             raise
+        _synchronize_timing_device(device)
         optimizer_end = time.perf_counter()
         logger.info("[rank %s] train_step=%03d optimizer_step_done", rank, global_step)
 
         # reveal loss (ALL ranks must call get_plain_text / reveal)
         loss_plain = loss_enc.get_plain_text().item()
+        _synchronize_timing_device(device)
         step_end = time.perf_counter()
         if args.experimental_reuse_mask:
             beaver_protocol.end_reuse_step(step_id)
@@ -1225,11 +1257,28 @@ def main():
             reuse_runtime_profile["beaver_revealed_tensors"].append(
                 beaver_delta.get("beaver_revealed_tensors", 0)
             )
+            reuse_runtime_profile["a_cache_hit"].append(beaver_delta.get("a_cache_hit", 0))
+            reuse_runtime_profile["a_cache_miss"].append(beaver_delta.get("a_cache_miss", 0))
+            reuse_runtime_profile["b_cache_hit"].append(beaver_delta.get("b_cache_hit", 0))
+            reuse_runtime_profile["b_cache_miss"].append(beaver_delta.get("b_cache_miss", 0))
+            reuse_runtime_profile["b_fresh_generated"].append(
+                beaver_delta.get("b_fresh_generated", 0)
+            )
+            reuse_runtime_profile["c_cache_hit"].append(beaver_delta.get("c_cache_hit", 0))
+            reuse_runtime_profile["c_cache_miss"].append(beaver_delta.get("c_cache_miss", 0))
+            reuse_runtime_profile["residual_anchor_hit"].append(
+                beaver_delta.get("residual_anchor_hit", 0)
+            )
+            reuse_runtime_profile["residual_anchor_miss"].append(
+                beaver_delta.get("residual_anchor_miss", 0)
+            )
 
             if rank == 0 and (global_step + 1) % max(1, args.reuse_log_every_steps) == 0:
                 logger.info(
                     "[reuse-profile] step=%03d prep=%.4fs fwd=%.4fs bwd=%.4fs opt=%.4fs step=%.4fs "
-                    "rounds=%s bytes=%s triple=%s reveals=%s reveal_tensors=%s",
+                    "rounds=%s bytes=%s triple=%s reveals=%s reveal_tensors=%s "
+                    "a_hit=%s a_miss=%s b_hit=%s b_miss=%s b_fresh=%s c_hit=%s c_miss=%s "
+                    "anchor_hit=%s anchor_miss=%s",
                     global_step + 1,
                     prep_end - prep_start,
                     forward_end - forward_start,
@@ -1241,6 +1290,15 @@ def main():
                     beaver_delta.get("triple_generate_calls", 0),
                     beaver_delta.get("beaver_reveal_calls", 0),
                     beaver_delta.get("beaver_revealed_tensors", 0),
+                    beaver_delta.get("a_cache_hit", 0),
+                    beaver_delta.get("a_cache_miss", 0),
+                    beaver_delta.get("b_cache_hit", 0),
+                    beaver_delta.get("b_cache_miss", 0),
+                    beaver_delta.get("b_fresh_generated", 0),
+                    beaver_delta.get("c_cache_hit", 0),
+                    beaver_delta.get("c_cache_miss", 0),
+                    beaver_delta.get("residual_anchor_hit", 0),
+                    beaver_delta.get("residual_anchor_miss", 0),
                 )
         global_step += 1
         if global_step % max(1, args.log_every_steps) == 0:

@@ -206,11 +206,23 @@ def _empty_metric_lists():
         "triple_generate_calls": [],
         "a_cache_hit": [],
         "a_cache_miss": [],
+        "a_base_cache_hit": [],
+        "a_base_cache_miss": [],
+        "a_derived_cache_hit": [],
+        "a_derived_generated": [],
         "b_cache_hit": [],
         "b_cache_miss": [],
+        "b_base_cache_hit": [],
+        "b_base_cache_miss": [],
+        "b_derived_cache_hit": [],
+        "b_derived_generated": [],
         "b_fresh_generated": [],
         "c_cache_hit": [],
         "c_cache_miss": [],
+        "c_cache_probe_hit": [],
+        "c_cache_probe_miss": [],
+        "c_cache_bypassed": [],
+        "c_fresh_generated": [],
         "residual_anchor_hit": [],
         "residual_anchor_miss": [],
     }
@@ -284,11 +296,23 @@ def _run_mode(args, case, mode_name, experimental_reuse_mask, reuse_mode, device
         metrics["triple_generate_calls"].append(beaver_delta.get("triple_generate_calls", 0))
         metrics["a_cache_hit"].append(beaver_delta.get("a_cache_hit", 0))
         metrics["a_cache_miss"].append(beaver_delta.get("a_cache_miss", 0))
+        metrics["a_base_cache_hit"].append(beaver_delta.get("a_base_cache_hit", 0))
+        metrics["a_base_cache_miss"].append(beaver_delta.get("a_base_cache_miss", 0))
+        metrics["a_derived_cache_hit"].append(beaver_delta.get("a_derived_cache_hit", 0))
+        metrics["a_derived_generated"].append(beaver_delta.get("a_derived_generated", 0))
         metrics["b_cache_hit"].append(beaver_delta.get("b_cache_hit", 0))
         metrics["b_cache_miss"].append(beaver_delta.get("b_cache_miss", 0))
+        metrics["b_base_cache_hit"].append(beaver_delta.get("b_base_cache_hit", 0))
+        metrics["b_base_cache_miss"].append(beaver_delta.get("b_base_cache_miss", 0))
+        metrics["b_derived_cache_hit"].append(beaver_delta.get("b_derived_cache_hit", 0))
+        metrics["b_derived_generated"].append(beaver_delta.get("b_derived_generated", 0))
         metrics["b_fresh_generated"].append(beaver_delta.get("b_fresh_generated", 0))
         metrics["c_cache_hit"].append(beaver_delta.get("c_cache_hit", 0))
         metrics["c_cache_miss"].append(beaver_delta.get("c_cache_miss", 0))
+        metrics["c_cache_probe_hit"].append(beaver_delta.get("c_cache_probe_hit", 0))
+        metrics["c_cache_probe_miss"].append(beaver_delta.get("c_cache_probe_miss", 0))
+        metrics["c_cache_bypassed"].append(beaver_delta.get("c_cache_bypassed", 0))
+        metrics["c_fresh_generated"].append(beaver_delta.get("c_fresh_generated", 0))
         metrics["residual_anchor_hit"].append(beaver_delta.get("residual_anchor_hit", 0))
         metrics["residual_anchor_miss"].append(beaver_delta.get("residual_anchor_miss", 0))
 
@@ -329,11 +353,23 @@ def _average_mode_runs(mode_runs):
         "triple_generate_calls",
         "a_cache_hit",
         "a_cache_miss",
+        "a_base_cache_hit",
+        "a_base_cache_miss",
+        "a_derived_cache_hit",
+        "a_derived_generated",
         "b_cache_hit",
         "b_cache_miss",
+        "b_base_cache_hit",
+        "b_base_cache_miss",
+        "b_derived_cache_hit",
+        "b_derived_generated",
         "b_fresh_generated",
         "c_cache_hit",
         "c_cache_miss",
+        "c_cache_probe_hit",
+        "c_cache_probe_miss",
+        "c_cache_bypassed",
+        "c_fresh_generated",
         "residual_anchor_hit",
         "residual_anchor_miss",
     ]
@@ -501,18 +537,32 @@ def _print_case_summary(case_result):
             f"triple={comparison['triple_reduction_pct']:.2f}% | "
             f"reveal_tensors={comparison['reveal_tensor_reduction_pct']:.2f}%"
         )
-    print("Cache counters per step:")
-    print("        mode | a_hit/miss | b_hit/miss | b_fresh | c_hit/miss | anchor_hit/miss")
+    print("Mask counters per step:")
+    print(
+        "        mode | a_base_hit/miss | a_der_hit/new | b_base_hit/miss | b_der_hit/new | b_fresh"
+    )
     for mode in mode_order:
         if mode not in case_result["summary"]:
             continue
         item = case_result["summary"][mode]
         print(
             f"{mode:>12} | "
-            f"{item['a_cache_hit']:.2f}/{item['a_cache_miss']:.2f} | "
-            f"{item['b_cache_hit']:.2f}/{item['b_cache_miss']:.2f} | "
-            f"{item['b_fresh_generated']:.2f} | "
-            f"{item['c_cache_hit']:.2f}/{item['c_cache_miss']:.2f} | "
+            f"{item['a_base_cache_hit']:.2f}/{item['a_base_cache_miss']:.2f} | "
+            f"{item['a_derived_cache_hit']:.2f}/{item['a_derived_generated']:.2f} | "
+            f"{item['b_base_cache_hit']:.2f}/{item['b_base_cache_miss']:.2f} | "
+            f"{item['b_derived_cache_hit']:.2f}/{item['b_derived_generated']:.2f} | "
+            f"{item['b_fresh_generated']:.2f}"
+        )
+    print("C/residual counters per step:")
+    print("        mode | c_hit/miss | c_bypass/fresh | anchor_hit/miss")
+    for mode in mode_order:
+        if mode not in case_result["summary"]:
+            continue
+        item = case_result["summary"][mode]
+        print(
+            f"{mode:>12} | "
+            f"{item['c_cache_probe_hit']:.2f}/{item['c_cache_probe_miss']:.2f} | "
+            f"{item['c_cache_bypassed']:.2f}/{item['c_fresh_generated']:.2f} | "
             f"{item['residual_anchor_hit']:.2f}/{item['residual_anchor_miss']:.2f}"
         )
 
@@ -545,11 +595,23 @@ def _build_csv_rows(rank0_payload):
                 "triple_generate_calls": item["triple_generate_calls"],
                 "a_cache_hit": item["a_cache_hit"],
                 "a_cache_miss": item["a_cache_miss"],
+                "a_base_cache_hit": item["a_base_cache_hit"],
+                "a_base_cache_miss": item["a_base_cache_miss"],
+                "a_derived_cache_hit": item["a_derived_cache_hit"],
+                "a_derived_generated": item["a_derived_generated"],
                 "b_cache_hit": item["b_cache_hit"],
                 "b_cache_miss": item["b_cache_miss"],
+                "b_base_cache_hit": item["b_base_cache_hit"],
+                "b_base_cache_miss": item["b_base_cache_miss"],
+                "b_derived_cache_hit": item["b_derived_cache_hit"],
+                "b_derived_generated": item["b_derived_generated"],
                 "b_fresh_generated": item["b_fresh_generated"],
                 "c_cache_hit": item["c_cache_hit"],
                 "c_cache_miss": item["c_cache_miss"],
+                "c_cache_probe_hit": item["c_cache_probe_hit"],
+                "c_cache_probe_miss": item["c_cache_probe_miss"],
+                "c_cache_bypassed": item["c_cache_bypassed"],
+                "c_fresh_generated": item["c_fresh_generated"],
                 "residual_anchor_hit": item["residual_anchor_hit"],
                 "residual_anchor_miss": item["residual_anchor_miss"],
                 "speedup_vs_baseline": comparisons.get(mode_name, {}).get(

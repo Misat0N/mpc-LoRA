@@ -213,6 +213,71 @@ Net effect intended by this follow-up fix:
 - avoid non-contiguous transpose views entering `matmul`,
 - preserve the protocol-level reuse behavior unchanged.
 
+## Counter semantics cleanup
+
+Observed issue in the previous benchmark output:
+
+- `a_cache_hit / a_cache_miss` and `b_cache_hit / b_cache_miss` mixed together:
+  - direct base-mask reuse
+  - derived transpose-mask reuse
+- `c_cache_miss` mixed together:
+  - actual cache lookup miss
+  - cache bypass fast path
+  - fresh `C` generation
+
+That made the benchmark harder to interpret. In particular:
+
+- `a_hit=0` did not mean no reuse happened,
+- `c_miss>0` did not mean the code was paying a real cache probe each time.
+
+Applied cleanup:
+
+### A / B mask counters
+
+Added:
+
+- `a_base_cache_hit`
+- `a_base_cache_miss`
+- `a_derived_cache_hit`
+- `a_derived_generated`
+- `b_base_cache_hit`
+- `b_base_cache_miss`
+- `b_derived_cache_hit`
+- `b_derived_generated`
+
+Meaning:
+
+- `*_base_*` tracks direct reuse of the base mask entry for the current tagged op
+- `*_derived_*` tracks transpose-derived reuse / generation from an anchor path
+
+### C counters
+
+Added:
+
+- `c_cache_probe_hit`
+- `c_cache_probe_miss`
+- `c_cache_bypassed`
+- `c_fresh_generated`
+
+Meaning:
+
+- `c_cache_probe_*` counts only real cache lookup events
+- `c_cache_bypassed` counts the fast path where caching was deliberately skipped
+- `c_fresh_generated` counts every fresh local `C = op(A, B)` construction
+
+Implementation points:
+
+- `crypten/mpc/primitives/beaver_reuse.py`
+  - `_PERF_COUNTERS`
+  - `_get_or_create_mask(...)`
+  - `get_or_create_C_for_op(...)`
+- `scripts/bench_reuse_tiny_mlp.py`
+  - summary printout now shows:
+    - mask counters
+    - `C/residual` counters
+- `examples/text-classification/run_glue_private_mpc_lora_train.py`
+  - `reuse_profile` now records and logs the detailed counters
+
 ## Expected post-fix differences
 
 `reuse_fix_a` should now differ from `reuse_fix_ab` in protocol counters.

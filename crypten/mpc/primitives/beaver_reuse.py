@@ -18,11 +18,23 @@ _PERF_COUNTERS = {
     "beaver_revealed_tensors": 0,
     "a_cache_hit": 0,
     "a_cache_miss": 0,
+    "a_base_cache_hit": 0,
+    "a_base_cache_miss": 0,
+    "a_derived_cache_hit": 0,
+    "a_derived_generated": 0,
     "b_cache_hit": 0,
     "b_cache_miss": 0,
+    "b_base_cache_hit": 0,
+    "b_base_cache_miss": 0,
+    "b_derived_cache_hit": 0,
+    "b_derived_generated": 0,
     "b_fresh_generated": 0,
     "c_cache_hit": 0,
     "c_cache_miss": 0,
+    "c_cache_probe_hit": 0,
+    "c_cache_probe_miss": 0,
+    "c_cache_bypassed": 0,
+    "c_fresh_generated": 0,
     "residual_cache_hit": 0,
     "residual_cache_miss": 0,
     "residual_anchor_hit": 0,
@@ -254,8 +266,9 @@ class BeaverReuseCache:
         self._register_entry(entry, cache_key=identity_key)
         return entry
 
-    def _derive_mask_entry(self, source_entry, transform):
-        transformed_plain = self._apply_plain_transform(source_entry.plain, transform)
+    def _derive_mask_entry(self, source_entry, transform, transformed_plain=None):
+        if transformed_plain is None:
+            transformed_plain = self._apply_plain_transform(source_entry.plain, transform)
         transformed_shared = self._apply_shared_transform(source_entry.shared, transform)
         return _MaskEntry(plain=transformed_plain, shared=transformed_shared)
 
@@ -274,10 +287,12 @@ class BeaverReuseCache:
             base_key = self._base_descriptor(normalized_tag, operand, device)
             if base_key in self._base_masks:
                 increment_perf_counter(f"{counter_prefix}_cache_hit")
+                increment_perf_counter(f"{counter_prefix}_base_cache_hit")
                 entry = self._base_masks[base_key]
                 self._register_entry(entry, cache_key=(base_key, "identity"))
                 return entry.shared
             increment_perf_counter(f"{counter_prefix}_cache_miss")
+            increment_perf_counter(f"{counter_prefix}_base_cache_miss")
             entry = self._create_and_register_base_mask(base_key, shape, device=device)
             return entry.shared
 
@@ -303,6 +318,7 @@ class BeaverReuseCache:
         if entry is not None:
             if entry.plain.size() == torch.Size(shape):
                 increment_perf_counter(f"{counter_prefix}_cache_hit")
+                increment_perf_counter(f"{counter_prefix}_derived_cache_hit")
                 self._register_entry(entry, cache_key=derived_key)
                 return entry.shared
 
@@ -311,9 +327,12 @@ class BeaverReuseCache:
             transformed_plain = self._random_plain_mask(shape, device=device)
             entry = self._create_mask_entry(transformed_plain)
         else:
-            entry = self._derive_mask_entry(source_entry, anchor["transform"])
+            entry = self._derive_mask_entry(
+                source_entry, anchor["transform"], transformed_plain=transformed_plain
+            )
         self._derived_masks[derived_key] = entry
         increment_perf_counter(f"{counter_prefix}_cache_miss")
+        increment_perf_counter(f"{counter_prefix}_derived_generated")
         self._register_entry(entry, cache_key=derived_key)
         return entry.shared
 
@@ -357,7 +376,8 @@ class BeaverReuseCache:
 
         cache_result = self.should_cache_c(tag, cache_result)
         if not cache_result:
-            increment_perf_counter("c_cache_miss")
+            increment_perf_counter("c_cache_bypassed")
+            increment_perf_counter("c_fresh_generated")
             c_plain = getattr(torch, op)(a_plain, b_plain, *args, **kwargs)
             entry = self._create_mask_entry(c_plain)
             self._register_entry(entry, cache_key=None)
@@ -366,7 +386,8 @@ class BeaverReuseCache:
         a_cache_key = self._shared_registry.get_cache_key(A)
         b_cache_key = self._shared_registry.get_cache_key(B)
         if a_cache_key is None or b_cache_key is None:
-            increment_perf_counter("c_cache_miss")
+            increment_perf_counter("c_cache_bypassed")
+            increment_perf_counter("c_fresh_generated")
             c_plain = getattr(torch, op)(a_plain, b_plain, *args, **kwargs)
             entry = self._create_mask_entry(c_plain)
             self._register_entry(entry, cache_key=None)
@@ -381,11 +402,14 @@ class BeaverReuseCache:
         )
         if cache_result and c_key in self._c_cache:
             increment_perf_counter("c_cache_hit")
+            increment_perf_counter("c_cache_probe_hit")
             entry = self._c_cache[c_key]
             self._register_entry(entry, cache_key=c_key)
             return entry.shared
 
         increment_perf_counter("c_cache_miss")
+        increment_perf_counter("c_cache_probe_miss")
+        increment_perf_counter("c_fresh_generated")
         c_plain = getattr(torch, op)(a_plain, b_plain, *args, **kwargs)
         entry = self._create_mask_entry(c_plain)
         if cache_result:

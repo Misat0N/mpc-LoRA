@@ -177,11 +177,23 @@ def _new_reuse_runtime_profile():
         "beaver_revealed_tensors": [],
         "a_cache_hit": [],
         "a_cache_miss": [],
+        "a_base_cache_hit": [],
+        "a_base_cache_miss": [],
+        "a_derived_cache_hit": [],
+        "a_derived_generated": [],
         "b_cache_hit": [],
         "b_cache_miss": [],
+        "b_base_cache_hit": [],
+        "b_base_cache_miss": [],
+        "b_derived_cache_hit": [],
+        "b_derived_generated": [],
         "b_fresh_generated": [],
         "c_cache_hit": [],
         "c_cache_miss": [],
+        "c_cache_probe_hit": [],
+        "c_cache_probe_miss": [],
+        "c_cache_bypassed": [],
+        "c_fresh_generated": [],
         "residual_anchor_hit": [],
         "residual_anchor_miss": [],
     }
@@ -1259,13 +1271,49 @@ def main():
             )
             reuse_runtime_profile["a_cache_hit"].append(beaver_delta.get("a_cache_hit", 0))
             reuse_runtime_profile["a_cache_miss"].append(beaver_delta.get("a_cache_miss", 0))
+            reuse_runtime_profile["a_base_cache_hit"].append(
+                beaver_delta.get("a_base_cache_hit", 0)
+            )
+            reuse_runtime_profile["a_base_cache_miss"].append(
+                beaver_delta.get("a_base_cache_miss", 0)
+            )
+            reuse_runtime_profile["a_derived_cache_hit"].append(
+                beaver_delta.get("a_derived_cache_hit", 0)
+            )
+            reuse_runtime_profile["a_derived_generated"].append(
+                beaver_delta.get("a_derived_generated", 0)
+            )
             reuse_runtime_profile["b_cache_hit"].append(beaver_delta.get("b_cache_hit", 0))
             reuse_runtime_profile["b_cache_miss"].append(beaver_delta.get("b_cache_miss", 0))
+            reuse_runtime_profile["b_base_cache_hit"].append(
+                beaver_delta.get("b_base_cache_hit", 0)
+            )
+            reuse_runtime_profile["b_base_cache_miss"].append(
+                beaver_delta.get("b_base_cache_miss", 0)
+            )
+            reuse_runtime_profile["b_derived_cache_hit"].append(
+                beaver_delta.get("b_derived_cache_hit", 0)
+            )
+            reuse_runtime_profile["b_derived_generated"].append(
+                beaver_delta.get("b_derived_generated", 0)
+            )
             reuse_runtime_profile["b_fresh_generated"].append(
                 beaver_delta.get("b_fresh_generated", 0)
             )
             reuse_runtime_profile["c_cache_hit"].append(beaver_delta.get("c_cache_hit", 0))
             reuse_runtime_profile["c_cache_miss"].append(beaver_delta.get("c_cache_miss", 0))
+            reuse_runtime_profile["c_cache_probe_hit"].append(
+                beaver_delta.get("c_cache_probe_hit", 0)
+            )
+            reuse_runtime_profile["c_cache_probe_miss"].append(
+                beaver_delta.get("c_cache_probe_miss", 0)
+            )
+            reuse_runtime_profile["c_cache_bypassed"].append(
+                beaver_delta.get("c_cache_bypassed", 0)
+            )
+            reuse_runtime_profile["c_fresh_generated"].append(
+                beaver_delta.get("c_fresh_generated", 0)
+            )
             reuse_runtime_profile["residual_anchor_hit"].append(
                 beaver_delta.get("residual_anchor_hit", 0)
             )
@@ -1277,8 +1325,9 @@ def main():
                 logger.info(
                     "[reuse-profile] step=%03d prep=%.4fs fwd=%.4fs bwd=%.4fs opt=%.4fs step=%.4fs "
                     "rounds=%s bytes=%s triple=%s reveals=%s reveal_tensors=%s "
-                    "a_hit=%s a_miss=%s b_hit=%s b_miss=%s b_fresh=%s c_hit=%s c_miss=%s "
-                    "anchor_hit=%s anchor_miss=%s",
+                    "a_base_hit=%s a_base_miss=%s a_der_hit=%s a_der_new=%s "
+                    "b_base_hit=%s b_base_miss=%s b_der_hit=%s b_der_new=%s b_fresh=%s "
+                    "c_hit=%s c_miss=%s c_bypass=%s c_fresh=%s anchor_hit=%s anchor_miss=%s",
                     global_step + 1,
                     prep_end - prep_start,
                     forward_end - forward_start,
@@ -1290,13 +1339,19 @@ def main():
                     beaver_delta.get("triple_generate_calls", 0),
                     beaver_delta.get("beaver_reveal_calls", 0),
                     beaver_delta.get("beaver_revealed_tensors", 0),
-                    beaver_delta.get("a_cache_hit", 0),
-                    beaver_delta.get("a_cache_miss", 0),
-                    beaver_delta.get("b_cache_hit", 0),
-                    beaver_delta.get("b_cache_miss", 0),
+                    beaver_delta.get("a_base_cache_hit", 0),
+                    beaver_delta.get("a_base_cache_miss", 0),
+                    beaver_delta.get("a_derived_cache_hit", 0),
+                    beaver_delta.get("a_derived_generated", 0),
+                    beaver_delta.get("b_base_cache_hit", 0),
+                    beaver_delta.get("b_base_cache_miss", 0),
+                    beaver_delta.get("b_derived_cache_hit", 0),
+                    beaver_delta.get("b_derived_generated", 0),
                     beaver_delta.get("b_fresh_generated", 0),
-                    beaver_delta.get("c_cache_hit", 0),
-                    beaver_delta.get("c_cache_miss", 0),
+                    beaver_delta.get("c_cache_probe_hit", 0),
+                    beaver_delta.get("c_cache_probe_miss", 0),
+                    beaver_delta.get("c_cache_bypassed", 0),
+                    beaver_delta.get("c_fresh_generated", 0),
                     beaver_delta.get("residual_anchor_hit", 0),
                     beaver_delta.get("residual_anchor_miss", 0),
                 )

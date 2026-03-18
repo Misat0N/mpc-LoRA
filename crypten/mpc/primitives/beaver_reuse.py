@@ -185,13 +185,35 @@ class BeaverReuseCache:
         raise ValueError(f"Unsupported transform `{transform}`")
 
     @staticmethod
-    def _apply_transform(tensor, transform):
+    def _apply_plain_transform(tensor, transform):
         if transform == "identity":
             return tensor
         if transform == "transpose":
             if tensor.dim() < 2:
                 return tensor
-            return tensor.transpose(-2, -1)
+            return tensor.transpose(-2, -1).contiguous()
+        raise ValueError(f"Unsupported transform `{transform}`")
+
+    @staticmethod
+    def _apply_shared_transform(shared, transform):
+        if transform == "identity":
+            return shared
+        if transform == "transpose":
+            if shared.share.dim() < 2:
+                return shared
+            result = shared.shallow_copy()
+            result.share = shared.share.transpose(-2, -1).contiguous()
+            return result
+        raise ValueError(f"Unsupported transform `{transform}`")
+
+    @staticmethod
+    def _apply_public_transform(tensor, transform):
+        if transform == "identity":
+            return tensor
+        if transform == "transpose":
+            if tensor.dim() < 2:
+                return tensor
+            return tensor.transpose(-2, -1).contiguous()
         raise ValueError(f"Unsupported transform `{transform}`")
 
     @staticmethod
@@ -233,8 +255,8 @@ class BeaverReuseCache:
         return entry
 
     def _derive_mask_entry(self, source_entry, transform):
-        transformed_plain = self._apply_transform(source_entry.plain, transform)
-        transformed_shared = self._apply_transform(source_entry.shared, transform)
+        transformed_plain = self._apply_plain_transform(source_entry.plain, transform)
+        transformed_shared = self._apply_shared_transform(source_entry.shared, transform)
         return _MaskEntry(plain=transformed_plain, shared=transformed_shared)
 
     def _get_or_create_mask(self, operand, shape, device, tag):
@@ -284,7 +306,7 @@ class BeaverReuseCache:
                 self._register_entry(entry, cache_key=derived_key)
                 return entry.shared
 
-        transformed_plain = self._apply_transform(source_entry.plain, anchor["transform"])
+        transformed_plain = self._apply_plain_transform(source_entry.plain, anchor["transform"])
         if transformed_plain.size() != torch.Size(shape):
             transformed_plain = self._random_plain_mask(shape, device=device)
             entry = self._create_mask_entry(transformed_plain)
@@ -428,7 +450,7 @@ class BeaverReuseCache:
         if source_value is None:
             increment_perf_counter("residual_anchor_miss")
             return None
-        transformed = self._apply_transform(source_value, anchor["transform"])
+        transformed = self._apply_public_transform(source_value, anchor["transform"])
         if transformed.size() != torch.Size(self._normalize_shape(expected_shape)):
             increment_perf_counter("residual_anchor_miss")
             return None

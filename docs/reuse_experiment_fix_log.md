@@ -169,6 +169,50 @@ Expected effect:
 - lower Python-side overhead for the current Linear training workload
 - lower overhead in `FIX_AB` where `C` cache had no practical hit rate in the observed runs
 
+## Follow-up fix after regression review
+
+Observed issue after the previous transpose-path optimization:
+
+- protocol counters remained correct,
+- but runtime regressed on some CUDA cases,
+- especially where transpose-derived masks / residuals were fed directly into `matmul`.
+
+Root cause:
+
+- the previous change removed `.contiguous()` from transpose transforms,
+- so derived mask shares and anchored public residuals became strided transpose views,
+- those non-contiguous tensors then entered `torch.matmul(...)`,
+- which can select a worse kernel path or trigger hidden copies on GPU.
+
+Applied fix:
+
+1. split transform helpers by tensor kind
+   - plaintext mask transform
+   - shared mask transform
+   - public residual transform
+2. keep the "no re-sharing" benefit for derived masks
+   - derived mask shares are still built from the existing source share
+   - they are not rebuilt with a new `ArithmeticSharedTensor(plain, src=0)`
+3. restore contiguous layout before compute
+   - transpose-derived plaintext masks now use `.contiguous()`
+   - transpose-derived shared masks now use `.contiguous()`
+   - transpose-derived public residuals now use `.contiguous()`
+
+Implementation points:
+
+- `crypten/mpc/primitives/beaver_reuse.py`
+  - `_apply_plain_transform(...)`
+  - `_apply_shared_transform(...)`
+  - `_apply_public_transform(...)`
+  - `_derive_mask_entry(...)`
+  - `get_opened_residual_from_anchor(...)`
+
+Net effect intended by this follow-up fix:
+
+- avoid the original re-sharing overhead,
+- avoid non-contiguous transpose views entering `matmul`,
+- preserve the protocol-level reuse behavior unchanged.
+
 ## Expected post-fix differences
 
 `reuse_fix_a` should now differ from `reuse_fix_ab` in protocol counters.

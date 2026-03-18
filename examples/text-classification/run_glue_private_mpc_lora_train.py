@@ -49,7 +49,9 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 import crypten as ct
+from crypten.common.reuse_context import clear_current_reuse_step, set_current_reuse_step
 from crypten.config import cfg
+from crypten.mpc.primitives import beaver as beaver_protocol
 from multiprocess_launcher import MultiProcessLauncher
 
 try:
@@ -147,6 +149,47 @@ def _loss_snapshot(loss_tensor):
     except Exception as err:
         snapshot["children_len"] = f"<error: {type(err).__name__}: {err}>"
     return snapshot
+
+
+def _delta_dict(after, before):
+    keys = set(before.keys()) | set(after.keys())
+    return {key: after.get(key, 0) - before.get(key, 0) for key in keys}
+
+
+def _mean(values):
+    if len(values) == 0:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def _new_reuse_runtime_profile():
+    return {
+        "prep_time_s": [],
+        "forward_time_s": [],
+        "backward_time_s": [],
+        "optimizer_time_s": [],
+        "step_time_s": [],
+        "comm_rounds": [],
+        "comm_bytes": [],
+        "comm_time_s": [],
+        "triple_generate_calls": [],
+        "beaver_reveal_calls": [],
+        "beaver_revealed_tensors": [],
+    }
+
+
+def _finalize_reuse_runtime_profile(profile):
+    return {key: _mean(values) for key, values in profile.items()}
+
+
+def _configure_reuse_experiment(args):
+    cfg.mpc.experimental_reuse_mask = args.experimental_reuse_mask
+    cfg.mpc.reuse_mode = args.reuse_mode
+    cfg.mpc.reuse_scope = "STEP"
+    cfg.mpc.reuse_op_types = ["matmul"]
+    cfg.mpc.reuse_tagging = True
+    if args.reuse_profile:
+        cfg.communicator.verbose = True
 
 
 def _safe_metric_compute(metric, steps, rank, phase):
@@ -604,6 +647,29 @@ def parse_args():
         help="If passed, print CrypTen communication cost statistics during execution.",
     )
     parser.add_argument(
+        "--experimental_reuse_mask",
+        action="store_true",
+        help="Enable the Beaver mask reuse performance experiment in CrypTen matmul.",
+    )
+    parser.add_argument(
+        "--reuse_mode",
+        type=str,
+        default="FIX_A",
+        choices=["FIX_A", "FIX_AB"],
+        help="Beaver reuse mode when --experimental_reuse_mask is enabled.",
+    )
+    parser.add_argument(
+        "--reuse_profile",
+        action="store_true",
+        help="Collect per-step Beaver/communication runtime stats during training.",
+    )
+    parser.add_argument(
+        "--reuse_log_every_steps",
+        type=int,
+        default=1,
+        help="Logging interval for reuse runtime stats when --reuse_profile is enabled.",
+    )
+    parser.add_argument(
         "--allow_spam_logs",
         action="store_true",
         help="If passed, do not filter verbose third-party debug prints (e.g. index_add debug).",
@@ -633,6 +699,7 @@ def parse_args():
 def main():
     script_start_time = time.time()
     args = parse_args()
+    _configure_reuse_experiment(args)
 
     if args.quick_run:
         args.pad_to_max_length = True
@@ -944,6 +1011,14 @@ def main():
         device,
     )
     logger.info("[rank %s] cfg after crypten init=%s", rank, _cfg_snapshot())
+    logger.info(
+        "[rank %s] reuse config: experimental=%s mode=%s profile=%s log_every=%s",
+        rank,
+        args.experimental_reuse_mask,
+        args.reuse_mode,
+        args.reuse_profile,
+        args.reuse_log_every_steps,
+    )
     # print("done")
     # exit()
     dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
@@ -1011,6 +1086,10 @@ def main():
 
     train_start_time = time.time()
     global_step = 0
+    reuse_runtime_profile = _new_reuse_runtime_profile() if args.reuse_profile else None
+    if args.reuse_profile:
+        beaver_protocol.reset_reuse_stats(reset_cache=True)
+        ct.reset_communication_stats()
     logger.info(
         "[rank %s] entering short-train loop max_train_steps=%s train_batch=%s",
         rank,
@@ -1033,19 +1112,30 @@ def main():
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(batch["input_ids"])
+        step_id = global_step
+        if args.experimental_reuse_mask:
+            set_current_reuse_step(step_id)
+            beaver_protocol.begin_reuse_step(step_id)
+        comm_before = ct.get_communication_stats() if args.reuse_profile else None
+        beaver_before = beaver_protocol.get_reuse_stats() if args.reuse_profile else None
+        step_start = time.perf_counter()
+        prep_start = step_start
         inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
         attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
         token_type_enc = ct.cryptensor(token_type_ids).to(device)
+        optimizer.zero_grad()
+        prep_end = time.perf_counter()
 
         # forward (NO ct.no_grad for training)
         # 在不设置ct.no_grad时自动默认训练模式，forward过程会记录backward所需结果
-        forward_start = time.time()
+        forward_start = prep_end
         logits_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)  # [B, num_labels]
+        forward_end = time.perf_counter()
         logger.info(
             "[rank %s] train_step=%03d forward_done dt=%.3fs logits_shape=%s",
             rank,
             global_step,
-            time.time() - forward_start,
+            forward_end - forward_start,
             _shape_of(logits_enc),
         )
 
@@ -1060,8 +1150,6 @@ def main():
         # optimizer (create once on first step)
         logger.info("[rank %s] train_step=%03d loss_snapshot=%s", rank, global_step, _loss_snapshot(loss_enc))
 
-        optimizer.zero_grad()
-        
         if global_step == 1:
             logger.info("[rank %s] train_step=%03d cfg consistency check start", rank, global_step)
             from crypten.config import cfg as cfg_main
@@ -1078,9 +1166,13 @@ def main():
             )
             # exit()
         logger.info("[rank %s] train_step=%03d backward_start", rank, global_step)
+        backward_start = time.perf_counter()
         try:
             loss_enc.backward()
         except Exception:
+            if args.experimental_reuse_mask:
+                beaver_protocol.end_reuse_step(step_id)
+                clear_current_reuse_step()
             logger.exception(
                 "[rank %s] train_step=%03d backward_failed cfg=%s loss=%s",
                 rank,
@@ -1089,23 +1181,78 @@ def main():
                 _loss_snapshot(loss_enc),
             )
             raise
+        backward_end = time.perf_counter()
         logger.info("[rank %s] train_step=%03d backward_done", rank, global_step)
 
+        optimizer_start = time.perf_counter()
         try:
             optimizer.step()
         except Exception:
+            if args.experimental_reuse_mask:
+                beaver_protocol.end_reuse_step(step_id)
+                clear_current_reuse_step()
             logger.exception("[rank %s] train_step=%03d optimizer_step_failed", rank, global_step)
             raise
+        optimizer_end = time.perf_counter()
         logger.info("[rank %s] train_step=%03d optimizer_step_done", rank, global_step)
 
         # reveal loss (ALL ranks must call get_plain_text / reveal)
         loss_plain = loss_enc.get_plain_text().item()
+        step_end = time.perf_counter()
+        if args.experimental_reuse_mask:
+            beaver_protocol.end_reuse_step(step_id)
+            clear_current_reuse_step()
+        if args.reuse_profile:
+            comm_after = ct.get_communication_stats()
+            beaver_after = beaver_protocol.get_reuse_stats()
+            comm_delta = _delta_dict(comm_after, comm_before)
+            beaver_delta = _delta_dict(beaver_after, beaver_before)
+
+            reuse_runtime_profile["prep_time_s"].append(prep_end - prep_start)
+            reuse_runtime_profile["forward_time_s"].append(forward_end - forward_start)
+            reuse_runtime_profile["backward_time_s"].append(backward_end - backward_start)
+            reuse_runtime_profile["optimizer_time_s"].append(optimizer_end - optimizer_start)
+            reuse_runtime_profile["step_time_s"].append(step_end - step_start)
+            reuse_runtime_profile["comm_rounds"].append(comm_delta.get("rounds", 0))
+            reuse_runtime_profile["comm_bytes"].append(comm_delta.get("bytes", 0))
+            reuse_runtime_profile["comm_time_s"].append(comm_delta.get("time", 0.0))
+            reuse_runtime_profile["triple_generate_calls"].append(
+                beaver_delta.get("triple_generate_calls", 0)
+            )
+            reuse_runtime_profile["beaver_reveal_calls"].append(
+                beaver_delta.get("beaver_reveal_calls", 0)
+            )
+            reuse_runtime_profile["beaver_revealed_tensors"].append(
+                beaver_delta.get("beaver_revealed_tensors", 0)
+            )
+
+            if rank == 0 and (global_step + 1) % max(1, args.reuse_log_every_steps) == 0:
+                logger.info(
+                    "[reuse-profile] step=%03d prep=%.4fs fwd=%.4fs bwd=%.4fs opt=%.4fs step=%.4fs "
+                    "rounds=%s bytes=%s triple=%s reveals=%s reveal_tensors=%s",
+                    global_step + 1,
+                    prep_end - prep_start,
+                    forward_end - forward_start,
+                    backward_end - backward_start,
+                    optimizer_end - optimizer_start,
+                    step_end - step_start,
+                    comm_delta.get("rounds", 0),
+                    comm_delta.get("bytes", 0),
+                    beaver_delta.get("triple_generate_calls", 0),
+                    beaver_delta.get("beaver_reveal_calls", 0),
+                    beaver_delta.get("beaver_revealed_tensors", 0),
+                )
         global_step += 1
         if global_step % max(1, args.log_every_steps) == 0:
             logger.info("[rank %s] [train] step=%03d loss=%.6f", rank, global_step, loss_plain)
         if args.max_train_steps > 0 and global_step >= args.max_train_steps:
             logger.info("[rank %s] reached max_train_steps=%s", rank, args.max_train_steps)
             break
+    reuse_profile_summary = None
+    if args.reuse_profile:
+        reuse_profile_summary = _finalize_reuse_runtime_profile(reuse_runtime_profile)
+        if rank == 0:
+            logger.info("[reuse-profile] summary=%s", reuse_profile_summary)
     logger.info(
         "[rank %s] short-train finished steps=%s elapsed=%.3fs",
         rank,
@@ -1240,6 +1387,9 @@ def main():
             "task_name": args.task_name,
             "max_train_steps": args.max_train_steps,
             "eval_max_steps": args.eval_max_steps,
+            "experimental_reuse_mask": args.experimental_reuse_mask,
+            "reuse_mode": args.reuse_mode,
+            "reuse_profile_summary": reuse_profile_summary,
         }
         summary_path = os.path.join(args.output_dir, "train_eval_summary.json")
         with open(summary_path, "w") as f:

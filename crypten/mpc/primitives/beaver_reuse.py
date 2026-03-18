@@ -191,7 +191,7 @@ class BeaverReuseCache:
         if transform == "transpose":
             if tensor.dim() < 2:
                 return tensor
-            return tensor.transpose(-2, -1).contiguous()
+            return tensor.transpose(-2, -1)
         raise ValueError(f"Unsupported transform `{transform}`")
 
     @staticmethod
@@ -231,6 +231,11 @@ class BeaverReuseCache:
         self._derived_masks[identity_key] = entry
         self._register_entry(entry, cache_key=identity_key)
         return entry
+
+    def _derive_mask_entry(self, source_entry, transform):
+        transformed_plain = self._apply_transform(source_entry.plain, transform)
+        transformed_shared = self._apply_transform(source_entry.shared, transform)
+        return _MaskEntry(plain=transformed_plain, shared=transformed_shared)
 
     def _get_or_create_mask(self, operand, shape, device, tag):
         normalized_tag = self._normalize_tag(tag)
@@ -282,7 +287,9 @@ class BeaverReuseCache:
         transformed_plain = self._apply_transform(source_entry.plain, anchor["transform"])
         if transformed_plain.size() != torch.Size(shape):
             transformed_plain = self._random_plain_mask(shape, device=device)
-        entry = self._create_mask_entry(transformed_plain)
+            entry = self._create_mask_entry(transformed_plain)
+        else:
+            entry = self._derive_mask_entry(source_entry, anchor["transform"])
         self._derived_masks[derived_key] = entry
         increment_perf_counter(f"{counter_prefix}_cache_miss")
         self._register_entry(entry, cache_key=derived_key)
@@ -305,10 +312,20 @@ class BeaverReuseCache:
         self._register_entry(entry, cache_key=None)
         return entry.shared
 
+    def should_cache_c(self, tag, cache_result=True):
+        if not cache_result:
+            return False
+        normalized_tag = self._normalize_tag(tag)
+        if normalized_tag.get("op_name") != "matmul":
+            return True
+        return (
+            normalized_tag.get("a_anchor") is not None
+            and normalized_tag.get("b_anchor") is not None
+        )
+
     def get_or_create_C_for_op(
         self, A, B, op, args=(), kwargs=None, tag=None, cache_result=True
     ):
-        del tag
         if kwargs is None:
             kwargs = {}
         a_plain = self._shared_registry.get_plain(A)
@@ -316,8 +333,22 @@ class BeaverReuseCache:
         if a_plain is None or b_plain is None:
             raise RuntimeError("Unable to locate plaintext masks for cached Beaver C.")
 
+        cache_result = self.should_cache_c(tag, cache_result)
+        if not cache_result:
+            increment_perf_counter("c_cache_miss")
+            c_plain = getattr(torch, op)(a_plain, b_plain, *args, **kwargs)
+            entry = self._create_mask_entry(c_plain)
+            self._register_entry(entry, cache_key=None)
+            return entry.shared
+
         a_cache_key = self._shared_registry.get_cache_key(A)
         b_cache_key = self._shared_registry.get_cache_key(B)
+        if a_cache_key is None or b_cache_key is None:
+            increment_perf_counter("c_cache_miss")
+            c_plain = getattr(torch, op)(a_plain, b_plain, *args, **kwargs)
+            entry = self._create_mask_entry(c_plain)
+            self._register_entry(entry, cache_key=None)
+            return entry.shared
         c_key = (
             "mask_c",
             op,

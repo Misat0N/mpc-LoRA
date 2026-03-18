@@ -111,6 +111,64 @@ Interpretation of the pre-fix result:
    - added CUDA synchronization to `reuse_profile`,
    - added cache / anchor counters to the profile summary.
 
+## Additional review-driven optimization in `beaver_reuse.py`
+
+### 1. Transpose-derived masks no longer re-share plaintext
+
+Previous behavior:
+
+- for a derived transpose mask, the code transposed the plaintext mask,
+- then created a brand new `ArithmeticSharedTensor(...)` from that plaintext.
+
+That meant transpose reuse still paid:
+
+- a new `ArithmeticSharedTensor` construction,
+- a new PRZS share generation path,
+- and an extra materialization step.
+
+New behavior:
+
+- transpose-derived masks are now built from the existing source mask entry,
+- the plaintext is transposed as a view,
+- and the encrypted share is also transposed directly from the existing share.
+
+Implementation points:
+
+- `crypten/mpc/primitives/beaver_reuse.py`
+  - `_apply_transform(...)` no longer forces `.contiguous()` on transpose
+  - `_derive_mask_entry(...)` derives a new mask entry from the source entry
+  - `_get_or_create_mask(...)` uses `_derive_mask_entry(...)` when the shape matches
+
+### 2. `C` cache is now opportunistic instead of always-on for `FIX_AB`
+
+Previous behavior:
+
+- `FIX_AB` always set `cache_c=True`
+- `get_or_create_C_for_op(...)` always built `c_key`
+- current TinyMLP traces showed `c_cache_hit=0` and only `c_cache_miss`
+
+That meant the code was paying cache bookkeeping cost without any observed hit.
+
+New behavior:
+
+- `should_cache_c(...)` enables `C` caching only when the tag pattern is more likely to
+  produce a reusable `C`
+- if caching is disabled, `get_or_create_C_for_op(...)` returns on the fast path without:
+  - building a `c_key`
+  - computing stable signatures for args / kwargs
+  - storing the entry in `_c_cache`
+
+Implementation points:
+
+- `crypten/mpc/primitives/beaver_reuse.py`
+  - `should_cache_c(...)`
+  - `get_or_create_C_for_op(...)` fast path when `cache_result=False`
+
+Expected effect:
+
+- lower Python-side overhead for the current Linear training workload
+- lower overhead in `FIX_AB` where `C` cache had no practical hit rate in the observed runs
+
 ## Expected post-fix differences
 
 `reuse_fix_a` should now differ from `reuse_fix_ab` in protocol counters.

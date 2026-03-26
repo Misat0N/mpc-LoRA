@@ -555,3 +555,82 @@ The grouping is explicit and step-scoped:
 - only applies when `--experimental_reuse_mask --reuse_mode SHARED_LEFT` are enabled
 - only affects grouped sibling matmuls that actually share one left operand
 - does not require the old `FIX_A` / `FIX_AB` reasoning at the training-entry level
+
+### Result record
+
+The first overnight / multi-repeat CUDA result interpretation for the new
+`shared_left` benchmark was written into:
+
+- `docs/shared_left_fanout_benchmark_2026-03-27_zh.md`
+
+That note records:
+
+- the raw benchmark output for `tiny / base / wide`
+- Chinese explanations for every printed metric
+- theory-vs-observation checks for:
+  - `a_base_cache_hit`
+  - `residual_cache_hit`
+  - `beaver_revealed_tensors`
+  - `bytes`
+- runtime interpretation for why protocol savings do not always translate into
+  wall-clock speedup
+
+## BERT quick-run blockers found after integrating SHARED_LEFT
+
+### Observed symptoms
+
+When running the encrypted GLUE / BERT quick path with:
+
+- `--experimental_reuse_mask`
+- `--reuse_mode SHARED_LEFT`
+
+two independent blockers were found:
+
+1. startup log showed:
+   - `[shared-left] no eligible grouped Gemm/Linear fan-out was detected in the CrypTen graph`
+2. training failed in:
+   - `LayerNormalization.forward()`
+   - `inv_sqrt()`
+   - with `RuntimeError: Autograd is not supported for in-place functions.`
+
+### Root causes
+
+1. Shared-left auto-grouping was too narrow
+   - the CrypTen graph produced by ONNX export for BERT uses `MatMul` nodes in the projection path
+   - the grouping pass only considered `Gemm` / `Linear`
+   - as a result, Q/K/V-style fan-out was not annotated at all
+
+2. CrypTen approximation functions still contained in-place tensor ops
+   - `inv_sqrt()` used `y -= ...` and `mul_ / div_`
+   - `sqrt()` used `mul_`
+   - several related approximation helpers (`log`, `reciprocal`, `_eix`, `tanh`, `_fourier_series`, `softmax`)
+     also used in-place updates that are incompatible with CrypTen autograd
+
+### Fixes applied
+
+1. `crypten/nn/module.py`
+   - `MatMul.forward()` now honors:
+     - `beaver_layer_tag`
+     - `beaver_a_group`
+   - grouped `MatMul` nodes execute under `use_a_group(...)`
+
+2. `examples/text-classification/run_glue_private_mpc_lora_train.py`
+   - `_is_shared_left_groupable_module(...)` now includes `ct.nn.MatMul`
+
+3. `crypten/common/functions/approximations.py`
+   - replaced high-risk in-place expressions with out-of-place equivalents in:
+     - `log`
+     - `reciprocal`
+     - `inv_sqrt`
+     - `sqrt`
+     - `_eix`
+     - `tanh` (ODE path)
+     - `_fourier_series`
+     - `softmax` (ODE path)
+
+### Expected effect after the fix
+
+1. shared-left grouping should begin to detect real BERT fan-out `MatMul` nodes
+2. the quick run should no longer fail immediately in `LayerNorm -> inv_sqrt()`
+3. if later failures remain, they are more likely to be downstream modeling / approximation issues,
+   not the original shared-left integration bug

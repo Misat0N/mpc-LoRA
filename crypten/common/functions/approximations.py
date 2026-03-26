@@ -108,7 +108,7 @@ def log(self, input_in_01=False):
     with cfg.temp_override({"functions.exp_iterations": exp_iterations}):
         for _ in range(iterations):
             h = 1 - self * exp(-y)
-            y -= h.polynomial([1 / (i + 1) for i in range(order)])
+            y = y - h.polynomial([1 / (i + 1) for i in range(order)])
     return y
 
 
@@ -174,7 +174,7 @@ def reciprocal(self, input_in_01=False):
             result = initial
         for _ in range(nr_iters):
             if hasattr(result, "square"):
-                result += result - result.square().mul_(self)
+                result = result + result - result.square().mul(self)
             else:
                 result = 2 * result - result * result * self
         return result
@@ -209,13 +209,13 @@ def inv_sqrt(self):
         # Initialize using decent approximation
         if initial is None:
             y = exp(self.div(2).add(0.2).neg()).mul(2.2).add(0.2)
-            y -= self.div(1024)
+            y = y - self.div(1024)
         else:
             y = initial
 
         # Newton Raphson iterations for inverse square root
         for _ in range(iters):
-            y = y.mul_(3 - self * y.square()).div_(2)
+            y = y.mul(3 - self * y.square()).div(2)
         return y
     else:
         raise ValueError(f"Invalid method {method} given for inv_sqrt function")
@@ -235,7 +235,7 @@ def sqrt(self):
     .. _Newton-Raphson:
         https://en.wikipedia.org/wiki/Fast_inverse_square_root#Newton's_method
     """
-    return inv_sqrt(self).mul_(self)
+    return inv_sqrt(self).mul(self)
 
 
 def _eix(self):
@@ -248,15 +248,14 @@ def _eix(self):
     im = self.div(2**iterations)
 
     # First iteration uses knowledge that `re` is public and = 1
-    re -= im.square()
-    im *= 2
+    re = re - im.square()
+    im = im * 2
 
     # Compute (a + bi)^2 -> (a^2 - b^2) + (2ab)i `iterations` times
     for _ in range(iterations - 1):
         a2 = re.square()
         b2 = im.square()
-        im = im.mul_(re)
-        im._tensor *= 2
+        im = im.mul(re) * 2
         re = a2 - b2
 
     return re, im
@@ -409,7 +408,7 @@ def tanh(self):
         x = self / iter_num
         y = self.new(torch.zeros_like(self.data), device=self.device)
         for _ in range(iter_num):
-            y += (1 - y * y) * x
+            y = y + (1 - y * y) * x
         return y
     else:
         raise ValueError(f"Unrecognized method {method} for tanh")
@@ -484,7 +483,7 @@ def _fourier_series(self, terms, period, alpha=None, beta_cos=None, beta_sin=Non
     res = ((v * p + u * q) * beta_sin).sum(dim=0)
 
     if alpha is not None:
-        res.add_(alpha)
+        res = res + alpha
     return res
 
 def erf(tensor):
@@ -636,7 +635,7 @@ def softmax(self, dim, **kwargs):
         if clip:
             # clip the input within the range [lower, upper] for numerical stability
             diff = crypten.cat([self - upper, lower - self]).relu().split(self.shape[0])#.split([1,1])
-            self += diff[1] - diff[0]
+            self = self + diff[1] - diff[0]
 
         # initialize ode approximation
         x = self / iter_num
@@ -644,7 +643,7 @@ def softmax(self, dim, **kwargs):
 
         # compute ode update formula
         for _ in range(iter_num):
-            g += (x - g.mul(x).sum(dim=dim).unsqueeze(-1)).squeeze(-1) * g
+            g = g + (x - g.mul(x).sum(dim=dim).unsqueeze(-1)).squeeze(-1) * g
         return g
     else:
         raise ValueError(f"Unrecognized method {method} for softmax")

@@ -234,7 +234,7 @@ def _synchronize_timing_device(device):
 
 
 def _is_shared_left_groupable_module(module):
-    return isinstance(module, (ct.nn.Gemm, ct.nn.Linear))
+    return isinstance(module, (ct.nn.Gemm, ct.nn.Linear, ct.nn.MatMul))
 
 
 def _shared_left_operand_transform(module):

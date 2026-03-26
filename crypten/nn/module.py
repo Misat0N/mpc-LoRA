@@ -2136,13 +2136,30 @@ class MatMul(Module):
             self.register_parameter("weight", weight)
 
     def forward(self, x):
+        layer_tag = getattr(self, "beaver_layer_tag", None)
+        group_tag = getattr(self, "beaver_a_group", None)
         if hasattr(self, "weight"):
-            output = x.matmul(self.weight)
-        else:
-            assert isinstance(x, (list, tuple)), "input must be list or tuple"
-            assert len(x) == 2, "input must contain two tensors"
-            output = x[0].matmul(x[1])
-        return output
+            if layer_tag is None and group_tag is None:
+                return x.matmul(self.weight)
+            if layer_tag is None:
+                layer_tag = f"matmul:{id(self)}"
+            with use_layer_tag(layer_tag):
+                if group_tag is None:
+                    return x.matmul(self.weight)
+                with use_a_group(group_tag):
+                    return x.matmul(self.weight)
+
+        assert isinstance(x, (list, tuple)), "input must be list or tuple"
+        assert len(x) == 2, "input must contain two tensors"
+        if layer_tag is None and group_tag is None:
+            return x[0].matmul(x[1])
+        if layer_tag is None:
+            layer_tag = f"matmul:{id(self)}"
+        with use_layer_tag(layer_tag):
+            if group_tag is None:
+                return x[0].matmul(x[1])
+            with use_a_group(group_tag):
+                return x[0].matmul(x[1])
 
     @staticmethod
     def from_onnx(attributes=None):

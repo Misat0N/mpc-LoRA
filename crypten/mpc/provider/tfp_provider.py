@@ -63,8 +63,11 @@ class TrustedFirstParty(TupleProvider):
         r = generate_unsigned_random_ring_element(size, ring_size=length, device=device)
         v = torch.nn.functional.one_hot(r, num_classes=length)
 
-        r = crypten.cryptensor(r, device=device)
-        v = crypten.cryptensor(v, device=device)
+        # These are integer masks for private table lookup. They must stay at
+        # precision 0 to match the TTP path and to avoid injecting fixed-point
+        # scaling into the custom Embedding lookup.
+        r = crypten.cryptensor(r, device=device, precision=0)
+        v = crypten.cryptensor(v, device=device, precision=0)
         return r, v
 
     def generate_binary_triple(self, size0, size1, device=None):

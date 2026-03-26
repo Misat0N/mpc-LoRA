@@ -634,3 +634,27 @@ two independent blockers were found:
 2. the quick run should no longer fail immediately in `LayerNorm -> inv_sqrt()`
 3. if later failures remain, they are more likely to be downstream modeling / approximation issues,
    not the original shared-left integration bug
+
+### Follow-up blocker: `AutogradTake.backward()` flatten edge case
+
+After the approximation / `MatMul` fixes, the next BERT quick-run failure moved to:
+
+- `crypten/gradients.py`
+- `AutogradTake.backward()`
+
+Observed error:
+
+- `RuntimeError: flatten() has invalid args: start_dim cannot come after end_dim`
+
+Root cause:
+
+- the backward implementation did not normalize negative `dim`
+- the implementation also assumed `index.dim() >= 1`
+- when `index` is scalar and `dim` is negative, `flatten(start_dim, end_dim)` can be
+  called with an invalid range
+
+Fix applied:
+
+- normalize `dim` into `[0, len(size))`
+- if `index.dim() == 0`, use `grad_output.unsqueeze(dim)` instead of flattening
+- otherwise keep the original flatten-based path

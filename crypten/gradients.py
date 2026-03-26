@@ -330,10 +330,16 @@ class AutogradTake(AutogradFunction):
             grad_flat[flat_index] = grad_output_flat
             grad = grad_flat.reshape(size)
         else:
+            dim = int(dim)
+            if dim < 0:
+                dim += len(size)
             flat_index = index.flatten()
-            grad_output_flat = grad_output.flatten(
-                start_dim=dim, end_dim=(dim + index.dim() - 1)
-            )
+            if index.dim() == 0:
+                grad_output_flat = grad_output.unsqueeze(dim)
+            else:
+                grad_output_flat = grad_output.flatten(
+                    start_dim=dim, end_dim=(dim + index.dim() - 1)
+                )
             grad.index_add_(dim, flat_index, grad_output_flat)
         return grad
 

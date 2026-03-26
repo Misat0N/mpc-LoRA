@@ -185,6 +185,100 @@ def _loss_snapshot(loss_tensor):
     return snapshot
 
 
+def _tensor_preview(tensor, limit=8):
+    try:
+        flat = tensor.detach().reshape(-1).cpu().to(torch.float32)
+        keep = min(limit, flat.numel())
+        return [float(v) for v in flat[:keep].tolist()]
+    except Exception as err:
+        return f"<error: {type(err).__name__}: {err}>"
+
+
+def _tensor_stats(tensor):
+    try:
+        flat = tensor.detach().reshape(-1).cpu().to(torch.float32)
+        if flat.numel() == 0:
+            return {"min": 0.0, "max": 0.0, "mean": 0.0}
+        return {
+            "min": float(flat.min().item()),
+            "max": float(flat.max().item()),
+            "mean": float(flat.mean().item()),
+        }
+    except Exception as err:
+        return {"error": f"{type(err).__name__}: {err}"}
+
+
+def _tensor_abs_diff_stats(lhs, rhs):
+    try:
+        diff = (lhs.detach().cpu().to(torch.float32) - rhs.detach().cpu().to(torch.float32)).abs().reshape(-1)
+        if diff.numel() == 0:
+            return {"max_abs": 0.0, "mean_abs": 0.0}
+        return {
+            "max_abs": float(diff.max().item()),
+            "mean_abs": float(diff.mean().item()),
+        }
+    except Exception as err:
+        return {"error": f"{type(err).__name__}: {err}"}
+
+
+def _run_eval_numeric_probe(rank, model, private_model, batch, token_type_ids, device, preview_limit=8):
+    summary = None
+    plain_training = model.training
+    private_training = private_model.training
+    try:
+        model.train(False)
+        private_model.train(False)
+        with torch.no_grad():
+            plain_outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_type_ids=token_type_ids,
+            )
+            plain_logits = plain_outputs.logits.detach().cpu()
+        with ct.no_grad():
+            inputs_probe = ct.cryptensor(batch["input_ids"]).to(device)
+            attention_mask_probe = ct.cryptensor(batch["attention_mask"]).to(device)
+            token_type_probe = ct.cryptensor(token_type_ids).to(device)
+            private_logits_enc = private_model(inputs_probe, attention_mask_probe, token_type_probe)
+            private_logits = private_logits_enc.get_plain_text().detach().cpu()
+        y_onehot = F.one_hot(batch["labels"], num_classes=plain_logits.size(-1)).float().cpu()
+        summary = {
+            "plain_logits_preview": _tensor_preview(plain_logits, limit=preview_limit),
+            "private_logits_preview": _tensor_preview(private_logits, limit=preview_limit),
+            "plain_logits_stats": _tensor_stats(plain_logits),
+            "private_logits_stats": _tensor_stats(private_logits),
+            "plain_private_abs_diff": _tensor_abs_diff_stats(private_logits, plain_logits),
+            "plain_eval_mse": float(((plain_logits - y_onehot) * (plain_logits - y_onehot)).mean().item()),
+            "private_eval_mse_from_revealed_logits": float(
+                ((private_logits - y_onehot) * (private_logits - y_onehot)).mean().item()
+            ),
+        }
+        if rank == 0:
+            logger.info("[numeric-probe] eval_forward_compare=%s", summary)
+    finally:
+        model.train(plain_training)
+        private_model.train(private_training)
+    return summary
+
+
+def _collect_train_numeric_probe(rank, logits_enc, loss_enc, y_onehot, preview_limit=8):
+    logits_plain = logits_enc.get_plain_text().detach().cpu()
+    revealed_loss = float(loss_enc.get_plain_text().item())
+    labels_plain = y_onehot.detach().cpu()
+    recomputed_mse = float(((logits_plain - labels_plain) * (logits_plain - labels_plain)).mean().item())
+    summary = {
+        "revealed_logits_preview": _tensor_preview(logits_plain, limit=preview_limit),
+        "revealed_logits_stats": _tensor_stats(logits_plain),
+        "label_onehot_preview": _tensor_preview(labels_plain, limit=preview_limit),
+        "revealed_loss": revealed_loss,
+        "recomputed_mse_from_revealed_logits": recomputed_mse,
+        "loss_minus_recomputed": float(revealed_loss - recomputed_mse),
+    }
+    if rank == 0:
+        logger.info("[numeric-probe] train_loss_compare=%s", summary)
+    return summary
+
+
 def _delta_dict(after, before):
     keys = set(before.keys()) | set(after.keys())
     return {key: after.get(key, 0) - before.get(key, 0) for key in keys}
@@ -884,6 +978,14 @@ def parse_args():
         help="If passed, do not filter verbose third-party debug prints (e.g. index_add debug).",
     )
     parser.add_argument(
+        "--debug_numeric_probe",
+        action="store_true",
+        help=(
+            "Run an extra step-0 numeric probe that compares plaintext vs CrypTen logits and checks "
+            "whether revealed loss matches loss recomputed from revealed logits."
+        ),
+    )
+    parser.add_argument(
         "--gpu_ids",
         type=str,
         default="",
@@ -1316,6 +1418,7 @@ def main():
     train_start_time = time.time()
     global_step = 0
     reuse_runtime_profile = _new_reuse_runtime_profile() if args.reuse_profile else None
+    numeric_probe_summary = None
     if args.reuse_profile:
         beaver_protocol.reset_reuse_stats(reset_cache=True)
         ct.reset_communication_stats()
@@ -1341,6 +1444,17 @@ def main():
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(batch["input_ids"])
+        if args.debug_numeric_probe and global_step == 0 and numeric_probe_summary is None:
+            numeric_probe_summary = {
+                "eval_forward_compare": _run_eval_numeric_probe(
+                    rank,
+                    model,
+                    private_model,
+                    batch,
+                    token_type_ids,
+                    device,
+                )
+            }
         step_id = global_step
         if args.experimental_reuse_mask:
             set_current_reuse_step(step_id)
@@ -1431,7 +1545,13 @@ def main():
         logger.info("[rank %s] train_step=%03d optimizer_step_done", rank, global_step)
 
         # reveal loss (ALL ranks must call get_plain_text / reveal)
-        loss_plain = loss_enc.get_plain_text().item()
+        if args.debug_numeric_probe and global_step == 0:
+            numeric_probe_summary["train_loss_compare"] = _collect_train_numeric_probe(
+                rank, logits_enc, loss_enc, y_onehot
+            )
+            loss_plain = numeric_probe_summary["train_loss_compare"]["revealed_loss"]
+        else:
+            loss_plain = loss_enc.get_plain_text().item()
         _synchronize_timing_device(device)
         step_end = time.perf_counter()
         if args.experimental_reuse_mask:
@@ -1704,6 +1824,7 @@ def main():
             "reuse_mode": args.reuse_mode,
             "shared_left_group_summary": shared_left_group_summary,
             "reuse_profile_summary": reuse_profile_summary,
+            "numeric_probe_summary": numeric_probe_summary,
         }
         summary_path = os.path.join(args.output_dir, "train_eval_summary.json")
         with open(summary_path, "w") as f:

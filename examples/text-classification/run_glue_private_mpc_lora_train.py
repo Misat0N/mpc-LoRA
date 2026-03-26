@@ -85,6 +85,39 @@ task_to_keys = {
 }
 
 logger = logging.getLogger(__name__)
+_PROCESS_LOG_TEE_INSTALLED = False
+_PROCESS_LOG_MIRROR = None
+
+
+class _TeeStream:
+    def __init__(self, stream, mirror):
+        self._stream = stream
+        self._mirror = mirror
+
+    def write(self, data):
+        written = self._stream.write(data)
+        self._mirror.write(data)
+        return written
+
+    def flush(self):
+        self._stream.flush()
+        self._mirror.flush()
+
+    def isatty(self):
+        try:
+            return self._stream.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", "utf-8")
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
 
 
 def _require_evaluate(need_eval):
@@ -556,6 +589,54 @@ def _install_print_filter():
     builtins.print = filtered_print
 
 
+def _default_log_dir():
+    return os.path.join(os.getcwd(), "logs", "run_glue_private_mpc_lora_train")
+
+
+def _resolve_process_log_path(args):
+    log_dir = args.output_dir if args.output_dir is not None else _default_log_dir()
+    os.makedirs(log_dir, exist_ok=True)
+    rank = os.environ.get("RANK", "main")
+    return os.path.join(log_dir, f"rank{rank}.log")
+
+
+def _tee_process_streams(log_path):
+    global _PROCESS_LOG_TEE_INSTALLED, _PROCESS_LOG_MIRROR
+    if _PROCESS_LOG_TEE_INSTALLED:
+        return log_path
+
+    mirror = open(log_path, "a", buffering=1, encoding="utf-8")
+    _PROCESS_LOG_MIRROR = mirror
+    sys.stdout = _TeeStream(sys.stdout, mirror)
+    sys.stderr = _TeeStream(sys.stderr, mirror)
+    _PROCESS_LOG_TEE_INSTALLED = True
+    return log_path
+
+
+def _configure_process_logging(args):
+    log_path = _tee_process_streams(_resolve_process_log_path(args))
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+        force=True,
+    )
+
+    if args.allow_spam_logs:
+        datasets.utils.logging.set_verbosity_warning()
+        transformers.utils.logging.set_verbosity_info()
+        logging.getLogger("torch.distributed").setLevel(logging.INFO)
+        logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.INFO)
+    else:
+        datasets.utils.logging.set_verbosity_warning()
+        transformers.utils.logging.set_verbosity_warning()
+        logging.getLogger("torch.distributed").setLevel(logging.WARNING)
+        logging.getLogger("torch.distributed.distributed_c10d").setLevel(logging.WARNING)
+        logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
+    return log_path
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     parser.add_argument(
@@ -855,12 +936,7 @@ def main():
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_glue_private", args)
 
-    # Make one log on every process with the configuration for debugging.
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
-    )
+    process_log_path = _configure_process_logging(args)
     if not args.allow_spam_logs:
         _install_print_filter()
 
@@ -870,6 +946,7 @@ def main():
     if target_recursion_limit != old_recursion_limit:
         sys.setrecursionlimit(target_recursion_limit)
     logger.info("train-smoke start pid=%s argv=%s", os.getpid(), " ".join(sys.argv))
+    logger.info("process log path=%s", process_log_path)
     logger.info("python recursion limit %s -> %s", old_recursion_limit, sys.getrecursionlimit())
     logger.info("initial cfg snapshot=%s", _cfg_snapshot())
     if args.quick_run:
@@ -887,10 +964,6 @@ def main():
             args.skip_plain_eval,
         )
 
-
-    datasets.utils.logging.set_verbosity_warning()
-    transformers.utils.logging.set_verbosity_info()
-    
     if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
 

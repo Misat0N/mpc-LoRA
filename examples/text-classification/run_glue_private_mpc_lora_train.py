@@ -18,7 +18,7 @@
 
 import argparse
 import builtins
-from collections import defaultdict
+from collections import defaultdict, deque
 import json
 import logging
 import math
@@ -1075,6 +1075,23 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--ce_softmax_method",
+        type=str,
+        default="reciprocal",
+        choices=["default", "reciprocal", "ode"],
+        help=(
+            "Softmax approximation to use inside CrypTen cross-entropy. "
+            "'default' keeps cfg.functions.softmax_method, while 'reciprocal' is typically "
+            "more stable than the global default 'ode' for CE training."
+        ),
+    )
+    parser.add_argument(
+        "--train_loss_window",
+        type=int,
+        default=8,
+        help="Window size for reporting running average train loss alongside the raw per-step loss.",
+    )
+    parser.add_argument(
         "--skip_private_eval",
         action="store_true",
         help="If passed, skip private evaluation after training.",
@@ -1198,8 +1215,9 @@ def main():
     need_eval = (not args.skip_private_eval) or (not args.skip_plain_eval)
     _require_evaluate(need_eval)
 
-    if args.seed is not None:
-        set_seed(args.seed)
+    if args.seed is None:
+        args.seed = 1234
+    set_seed(args.seed)
 
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
@@ -1218,7 +1236,9 @@ def main():
     logger.info("process log path=%s", process_log_path)
     logger.info("python recursion limit %s -> %s", old_recursion_limit, sys.getrecursionlimit())
     logger.info("initial cfg snapshot=%s", _cfg_snapshot())
+    logger.info("resolved seed=%s", args.seed)
     logger.info("resolved loss_type=%s", args.loss_type)
+    logger.info("resolved ce_softmax_method=%s", args.ce_softmax_method)
     if args.quick_run:
         logger.info(
             "[quick-run] enabled: len=%s max_length=%s train_steps=%s train_samples=%s eval_samples=%s "
@@ -1431,12 +1451,15 @@ def main():
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=None)
 
     train_dataset = processed_datasets["train"]
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
     train_dataloader = DataLoader(
         train_dataset,
         collate_fn=data_collator,
         batch_size=args.per_device_train_batch_size,
         shuffle=True,
+        generator=train_generator,
     )
 
     # Get the metric function
@@ -1602,11 +1625,13 @@ def main():
         beaver_protocol.reset_reuse_stats(reset_cache=True)
         ct.reset_communication_stats()
     logger.info(
-        "[rank %s] entering short-train loop max_train_steps=%s train_batch=%s",
+        "[rank %s] entering short-train loop max_train_steps=%s train_batch=%s train_loss_window=%s",
         rank,
         args.max_train_steps,
         args.per_device_train_batch_size,
+        args.train_loss_window,
     )
+    recent_train_losses = deque(maxlen=max(1, args.train_loss_window))
     for _, batch in enumerate(train_dataloader):
         rank = _get_rank()
         logger.info(
@@ -1669,7 +1694,11 @@ def main():
         y_onehot = F.one_hot(batch["labels"], num_classes=num_labels).float()
         y_enc = ct.cryptensor(y_onehot).to(device)
         if args.loss_type == "ce":
-            loss_enc = logits_enc.cross_entropy(y_enc)
+            if args.ce_softmax_method == "default":
+                loss_enc = logits_enc.cross_entropy(y_enc)
+            else:
+                with cfg.temp_override({"functions.softmax_method": args.ce_softmax_method}):
+                    loss_enc = logits_enc.cross_entropy(y_enc)
         elif args.loss_type == "mse":
             diff = logits_enc - y_enc
             loss_enc = (diff * diff).mean()
@@ -1864,7 +1893,16 @@ def main():
                 )
         global_step += 1
         if global_step % max(1, args.log_every_steps) == 0:
-            logger.info("[rank %s] [train] step=%03d loss=%.6f", rank, global_step, loss_plain)
+            recent_train_losses.append(float(loss_plain))
+            running_loss = sum(recent_train_losses) / len(recent_train_losses)
+            logger.info(
+                "[rank %s] [train] step=%03d loss=%.6f running_loss(window=%s)=%.6f",
+                rank,
+                global_step,
+                loss_plain,
+                len(recent_train_losses),
+                running_loss,
+            )
         if args.max_train_steps > 0 and global_step >= args.max_train_steps:
             logger.info("[rank %s] reached max_train_steps=%s", rank, args.max_train_steps)
             break

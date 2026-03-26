@@ -366,36 +366,47 @@ def _run_embeddings_numeric_probe(model, input_ids, token_type_ids, device, prev
     }
 
 
-def _collect_train_numeric_probe(rank, logits_enc, loss_enc, y_onehot, preview_limit=8):
+def _recompute_loss_from_revealed_logits(logits_plain, labels_plain, loss_type):
+    logits_plain = logits_plain.detach().cpu().to(torch.float32)
+    labels_plain = labels_plain.detach().cpu().to(torch.float32)
+    if loss_type == "ce":
+        probs = torch.softmax(logits_plain, dim=-1)
+        return float(-(labels_plain * torch.log(probs)).sum(dim=-1).mean().item())
+    return float(((logits_plain - labels_plain) * (logits_plain - labels_plain)).mean().item())
+
+
+def _collect_train_numeric_probe(rank, logits_enc, loss_enc, y_onehot, loss_type, preview_limit=8):
     logits_plain = logits_enc.get_plain_text().detach().cpu()
     revealed_loss = float(loss_enc.get_plain_text().item())
     labels_plain = y_onehot.detach().cpu()
-    recomputed_mse = float(((logits_plain - labels_plain) * (logits_plain - labels_plain)).mean().item())
+    recomputed_loss = _recompute_loss_from_revealed_logits(logits_plain, labels_plain, loss_type)
     summary = {
+        "loss_type": loss_type,
         "revealed_logits_preview": _tensor_preview(logits_plain, limit=preview_limit),
         "revealed_logits_stats": _tensor_stats(logits_plain),
         "label_onehot_preview": _tensor_preview(labels_plain, limit=preview_limit),
         "revealed_loss": revealed_loss,
-        "recomputed_mse_from_revealed_logits": recomputed_mse,
-        "loss_minus_recomputed": float(revealed_loss - recomputed_mse),
+        "recomputed_loss_from_revealed_logits": recomputed_loss,
+        "loss_minus_recomputed": float(revealed_loss - recomputed_loss),
     }
     if rank == 0:
         logger.info("[numeric-probe] train_loss_compare=%s", summary)
     return summary
 
 
-def _collect_train_pre_backward_numeric_probe(rank, logits_enc, loss_enc, y_onehot, preview_limit=8):
+def _collect_train_pre_backward_numeric_probe(rank, logits_enc, loss_enc, y_onehot, loss_type, preview_limit=8):
     logits_plain = logits_enc.get_plain_text().detach().cpu()
     revealed_loss = float(loss_enc.get_plain_text().item())
     labels_plain = y_onehot.detach().cpu()
-    recomputed_mse = float(((logits_plain - labels_plain) * (logits_plain - labels_plain)).mean().item())
+    recomputed_loss = _recompute_loss_from_revealed_logits(logits_plain, labels_plain, loss_type)
     summary = {
+        "loss_type": loss_type,
         "revealed_logits_preview": _tensor_preview(logits_plain, limit=preview_limit),
         "revealed_logits_stats": _tensor_stats(logits_plain),
         "label_onehot_preview": _tensor_preview(labels_plain, limit=preview_limit),
         "revealed_loss": revealed_loss,
-        "recomputed_mse_from_revealed_logits": recomputed_mse,
-        "loss_minus_recomputed": float(revealed_loss - recomputed_mse),
+        "recomputed_loss_from_revealed_logits": recomputed_loss,
+        "loss_minus_recomputed": float(revealed_loss - recomputed_loss),
     }
     if rank == 0:
         logger.info("[numeric-probe] train_pre_backward_compare=%s", summary)
@@ -1034,6 +1045,16 @@ def parse_args():
         help="Momentum for MPC SGD optimizer.",
     )
     parser.add_argument(
+        "--loss_type",
+        type=str,
+        default="auto",
+        choices=["auto", "mse", "ce"],
+        help=(
+            "Training loss to use. 'auto' resolves to 'mse' in --quick_run for stability "
+            "and 'ce' otherwise for better classification accuracy."
+        ),
+    )
+    parser.add_argument(
         "--skip_private_eval",
         action="store_true",
         help="If passed, skip private evaluation after training.",
@@ -1151,6 +1172,9 @@ def main():
         args.skip_private_eval = True
         args.skip_plain_eval = True
 
+    if args.loss_type == "auto":
+        args.loss_type = "mse" if args.quick_run else "ce"
+
     need_eval = (not args.skip_private_eval) or (not args.skip_plain_eval)
     _require_evaluate(need_eval)
 
@@ -1174,10 +1198,11 @@ def main():
     logger.info("process log path=%s", process_log_path)
     logger.info("python recursion limit %s -> %s", old_recursion_limit, sys.getrecursionlimit())
     logger.info("initial cfg snapshot=%s", _cfg_snapshot())
+    logger.info("resolved loss_type=%s", args.loss_type)
     if args.quick_run:
         logger.info(
             "[quick-run] enabled: len=%s max_length=%s train_steps=%s train_samples=%s eval_samples=%s "
-            "lora_r=%s freeze_classifier_head=%s skip_private_eval=%s skip_plain_eval=%s",
+            "lora_r=%s freeze_classifier_head=%s skip_private_eval=%s skip_plain_eval=%s loss_type=%s",
             args.len_data,
             args.max_length,
             args.max_train_steps,
@@ -1187,6 +1212,7 @@ def main():
             args.freeze_classifier_head,
             args.skip_private_eval,
             args.skip_plain_eval,
+            args.loss_type,
         )
 
     if args.output_dir is not None:
@@ -1608,19 +1634,23 @@ def main():
             _shape_of(logits_enc),
         )
 
-        # MSE loss with one-hot labels (more stable than CE for MPC smoke test)
+        # For smoke tests we keep MSE available, but normal training should use CE.
         num_labels = logits_enc.size(-1)
         y_onehot = F.one_hot(batch["labels"], num_classes=num_labels).float()
         y_enc = ct.cryptensor(y_onehot).to(device)
-
-        diff = logits_enc - y_enc
-        loss_enc = (diff * diff).mean()
+        if args.loss_type == "ce":
+            loss_enc = logits_enc.cross_entropy(y_enc)
+        elif args.loss_type == "mse":
+            diff = logits_enc - y_enc
+            loss_enc = (diff * diff).mean()
+        else:
+            raise ValueError(f"Unsupported loss_type: {args.loss_type}")
 
         # optimizer (create once on first step)
         logger.info("[rank %s] train_step=%03d loss_snapshot=%s", rank, global_step, _loss_snapshot(loss_enc))
         if args.debug_numeric_probe and global_step == 0:
             numeric_probe_summary["train_pre_backward_compare"] = _collect_train_pre_backward_numeric_probe(
-                rank, logits_enc, loss_enc, y_onehot
+                rank, logits_enc, loss_enc, y_onehot, args.loss_type
             )
 
         if global_step == 1:
@@ -1674,7 +1704,7 @@ def main():
         # reveal loss (ALL ranks must call get_plain_text / reveal)
         if args.debug_numeric_probe and global_step == 0:
             numeric_probe_summary["train_loss_compare"] = _collect_train_numeric_probe(
-                rank, logits_enc, loss_enc, y_onehot
+                rank, logits_enc, loss_enc, y_onehot, args.loss_type
             )
             loss_plain = numeric_probe_summary["train_loss_compare"]["revealed_loss"]
         else:

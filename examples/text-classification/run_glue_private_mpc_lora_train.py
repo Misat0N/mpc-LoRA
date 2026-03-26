@@ -239,8 +239,12 @@ def _run_eval_numeric_probe(rank, model, private_model, batch, token_type_ids, d
             inputs_probe = ct.cryptensor(batch["input_ids"]).to(device)
             attention_mask_probe = ct.cryptensor(batch["attention_mask"]).to(device)
             token_type_probe = ct.cryptensor(token_type_ids).to(device)
-            private_logits_enc = private_model(inputs_probe, attention_mask_probe, token_type_probe)
-            private_logits = private_logits_enc.get_plain_text().detach().cpu()
+            private_logits_eval_nograd_enc = private_model(
+                inputs_probe, attention_mask_probe, token_type_probe
+            )
+            private_logits_eval_nograd = private_logits_eval_nograd_enc.get_plain_text().detach().cpu()
+        private_logits_eval_grad_enc = private_model(inputs_probe, attention_mask_probe, token_type_probe)
+        private_logits_eval_grad = private_logits_eval_grad_enc.get_plain_text().detach().cpu()
         embeddings_probe = _run_embeddings_numeric_probe(
             model,
             batch["input_ids"],
@@ -252,13 +256,28 @@ def _run_eval_numeric_probe(rank, model, private_model, batch, token_type_ids, d
         summary = {
             "embeddings_probe": embeddings_probe,
             "plain_logits_preview": _tensor_preview(plain_logits, limit=preview_limit),
-            "private_logits_preview": _tensor_preview(private_logits, limit=preview_limit),
+            "private_logits_preview": _tensor_preview(private_logits_eval_nograd, limit=preview_limit),
+            "private_logits_eval_nograd_preview": _tensor_preview(private_logits_eval_nograd, limit=preview_limit),
+            "private_logits_eval_grad_preview": _tensor_preview(private_logits_eval_grad, limit=preview_limit),
             "plain_logits_stats": _tensor_stats(plain_logits),
-            "private_logits_stats": _tensor_stats(private_logits),
-            "plain_private_abs_diff": _tensor_abs_diff_stats(private_logits, plain_logits),
+            "private_logits_stats": _tensor_stats(private_logits_eval_nograd),
+            "private_logits_eval_nograd_stats": _tensor_stats(private_logits_eval_nograd),
+            "private_logits_eval_grad_stats": _tensor_stats(private_logits_eval_grad),
+            "plain_private_abs_diff": _tensor_abs_diff_stats(private_logits_eval_nograd, plain_logits),
+            "plain_private_eval_nograd_abs_diff": _tensor_abs_diff_stats(private_logits_eval_nograd, plain_logits),
+            "plain_private_eval_grad_abs_diff": _tensor_abs_diff_stats(private_logits_eval_grad, plain_logits),
+            "eval_nograd_vs_grad_abs_diff": _tensor_abs_diff_stats(
+                private_logits_eval_nograd, private_logits_eval_grad
+            ),
             "plain_eval_mse": float(((plain_logits - y_onehot) * (plain_logits - y_onehot)).mean().item()),
             "private_eval_mse_from_revealed_logits": float(
-                ((private_logits - y_onehot) * (private_logits - y_onehot)).mean().item()
+                ((private_logits_eval_nograd - y_onehot) * (private_logits_eval_nograd - y_onehot)).mean().item()
+            ),
+            "private_eval_nograd_mse_from_revealed_logits": float(
+                ((private_logits_eval_nograd - y_onehot) * (private_logits_eval_nograd - y_onehot)).mean().item()
+            ),
+            "private_eval_grad_mse_from_revealed_logits": float(
+                ((private_logits_eval_grad - y_onehot) * (private_logits_eval_grad - y_onehot)).mean().item()
             ),
         }
         if rank == 0:

@@ -241,8 +241,16 @@ def _run_eval_numeric_probe(rank, model, private_model, batch, token_type_ids, d
             token_type_probe = ct.cryptensor(token_type_ids).to(device)
             private_logits_enc = private_model(inputs_probe, attention_mask_probe, token_type_probe)
             private_logits = private_logits_enc.get_plain_text().detach().cpu()
+        embeddings_probe = _run_embeddings_numeric_probe(
+            model,
+            batch["input_ids"],
+            token_type_ids,
+            device,
+            preview_limit=preview_limit,
+        )
         y_onehot = F.one_hot(batch["labels"], num_classes=plain_logits.size(-1)).float().cpu()
         summary = {
+            "embeddings_probe": embeddings_probe,
             "plain_logits_preview": _tensor_preview(plain_logits, limit=preview_limit),
             "private_logits_preview": _tensor_preview(private_logits, limit=preview_limit),
             "plain_logits_stats": _tensor_stats(plain_logits),
@@ -259,6 +267,84 @@ def _run_eval_numeric_probe(rank, model, private_model, batch, token_type_ids, d
         model.train(plain_training)
         private_model.train(private_training)
     return summary
+
+
+def _run_embeddings_numeric_probe(model, input_ids, token_type_ids, device, preview_limit=8):
+    from crypten.nn.module import Embedding as CrypTenEmbedding
+    from crypten.nn.module import LayerNormalization as CrypTenLayerNormalization
+
+    bert_embeddings = model.bert.embeddings
+    seq_len = input_ids.size(1)
+    position_ids = bert_embeddings.position_ids[:, :seq_len].to(input_ids.device)
+    dummy_padding_idx = torch.tensor(-1, device=device)
+
+    with torch.no_grad():
+        plain_word = bert_embeddings.word_embeddings(input_ids).detach().cpu()
+        plain_token = bert_embeddings.token_type_embeddings(token_type_ids).detach().cpu()
+        plain_position = bert_embeddings.position_embeddings(position_ids).detach().cpu()
+        plain_sum = (plain_word + plain_token + plain_position).detach().cpu()
+        plain_norm = bert_embeddings.LayerNorm(plain_sum).detach().cpu()
+
+    embed_op = CrypTenEmbedding()
+    norm_op = CrypTenLayerNormalization(axis=-1, eps=bert_embeddings.LayerNorm.eps)
+
+    word_weight_enc = ct.cryptensor(bert_embeddings.word_embeddings.weight.detach()).to(device)
+    token_weight_enc = ct.cryptensor(bert_embeddings.token_type_embeddings.weight.detach()).to(device)
+    position_weight_enc = ct.cryptensor(bert_embeddings.position_embeddings.weight.detach()).to(device)
+    norm_weight_enc = ct.cryptensor(bert_embeddings.LayerNorm.weight.detach()).to(device)
+    norm_bias_enc = ct.cryptensor(bert_embeddings.LayerNorm.bias.detach()).to(device)
+
+    input_ids_default = ct.cryptensor(input_ids).to(device)
+    token_type_default = ct.cryptensor(token_type_ids).to(device)
+    position_ids_default = ct.cryptensor(position_ids).to(device)
+
+    input_ids_p0 = ct.cryptensor(input_ids, precision=0).to(device)
+    token_type_p0 = ct.cryptensor(token_type_ids, precision=0).to(device)
+    position_ids_p0 = ct.cryptensor(position_ids, precision=0).to(device)
+
+    with ct.no_grad():
+        word_default = embed_op((word_weight_enc, input_ids_default, dummy_padding_idx)).get_plain_text().detach().cpu()
+        word_p0 = embed_op((word_weight_enc, input_ids_p0, dummy_padding_idx)).get_plain_text().detach().cpu()
+
+        token_default = embed_op((token_weight_enc, token_type_default, dummy_padding_idx)).get_plain_text().detach().cpu()
+        token_p0 = embed_op((token_weight_enc, token_type_p0, dummy_padding_idx)).get_plain_text().detach().cpu()
+
+        position_default = embed_op((position_weight_enc, position_ids_default, dummy_padding_idx)).get_plain_text().detach().cpu()
+        position_p0 = embed_op((position_weight_enc, position_ids_p0, dummy_padding_idx)).get_plain_text().detach().cpu()
+
+        sum_default_enc = (
+            embed_op((word_weight_enc, input_ids_default, dummy_padding_idx))
+            + embed_op((token_weight_enc, token_type_default, dummy_padding_idx))
+            + embed_op((position_weight_enc, position_ids_default, dummy_padding_idx))
+        )
+        sum_p0_enc = (
+            embed_op((word_weight_enc, input_ids_p0, dummy_padding_idx))
+            + embed_op((token_weight_enc, token_type_p0, dummy_padding_idx))
+            + embed_op((position_weight_enc, position_ids_p0, dummy_padding_idx))
+        )
+        sum_default = sum_default_enc.get_plain_text().detach().cpu()
+        sum_p0 = sum_p0_enc.get_plain_text().detach().cpu()
+        norm_default = norm_op((sum_default_enc, norm_weight_enc, norm_bias_enc)).get_plain_text().detach().cpu()
+        norm_p0 = norm_op((sum_p0_enc, norm_weight_enc, norm_bias_enc)).get_plain_text().detach().cpu()
+
+    return {
+        "plain_word_preview": _tensor_preview(plain_word, limit=preview_limit),
+        "private_word_default_preview": _tensor_preview(word_default, limit=preview_limit),
+        "private_word_p0_preview": _tensor_preview(word_p0, limit=preview_limit),
+        "word_default_abs_diff": _tensor_abs_diff_stats(word_default, plain_word),
+        "word_p0_abs_diff": _tensor_abs_diff_stats(word_p0, plain_word),
+        "token_default_abs_diff": _tensor_abs_diff_stats(token_default, plain_token),
+        "token_p0_abs_diff": _tensor_abs_diff_stats(token_p0, plain_token),
+        "position_default_abs_diff": _tensor_abs_diff_stats(position_default, plain_position),
+        "position_p0_abs_diff": _tensor_abs_diff_stats(position_p0, plain_position),
+        "sum_default_abs_diff": _tensor_abs_diff_stats(sum_default, plain_sum),
+        "sum_p0_abs_diff": _tensor_abs_diff_stats(sum_p0, plain_sum),
+        "norm_default_abs_diff": _tensor_abs_diff_stats(norm_default, plain_norm),
+        "norm_p0_abs_diff": _tensor_abs_diff_stats(norm_p0, plain_norm),
+        "norm_default_preview": _tensor_preview(norm_default, limit=preview_limit),
+        "norm_p0_preview": _tensor_preview(norm_p0, limit=preview_limit),
+        "plain_norm_preview": _tensor_preview(plain_norm, limit=preview_limit),
+    }
 
 
 def _collect_train_numeric_probe(rank, logits_enc, loss_enc, y_onehot, preview_limit=8):

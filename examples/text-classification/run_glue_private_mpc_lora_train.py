@@ -1045,6 +1045,26 @@ def parse_args():
         help="Momentum for MPC SGD optimizer.",
     )
     parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.0,
+        help="Weight decay for MPC SGD optimizer.",
+    )
+    parser.add_argument(
+        "--nesterov",
+        action="store_true",
+        help="Enable Nesterov momentum for MPC SGD optimizer.",
+    )
+    parser.add_argument(
+        "--grad_threshold",
+        type=float,
+        default=-1.0,
+        help=(
+            "If > 0, zero out gradient elements whose absolute value exceeds this threshold "
+            "inside CrypTen SGD."
+        ),
+    )
+    parser.add_argument(
         "--loss_type",
         type=str,
         default="auto",
@@ -1505,12 +1525,22 @@ def main():
                 )
     private_model.train()
     lr = args.learning_rate
-    optimizer = ct.optim.SGD(private_model.parameters(), lr=lr, momentum=args.momentum)
+    optimizer = ct.optim.SGD(
+        private_model.parameters(),
+        lr=lr,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+        nesterov=args.nesterov,
+        grad_threshold=(args.grad_threshold if args.grad_threshold > 0 else None),
+    )
     logger.info(
-        "[rank %s] model set to train mode; optimizer initialized (lr=%s momentum=%s)",
+        "[rank %s] model set to train mode; optimizer initialized (lr=%s momentum=%s weight_decay=%s nesterov=%s grad_threshold=%s)",
         rank,
         lr,
         args.momentum,
+        args.weight_decay,
+        args.nesterov,
+        (args.grad_threshold if args.grad_threshold > 0 else None),
     )
     # 模型不加密
     # private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).to(device)

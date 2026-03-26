@@ -407,3 +407,151 @@ Immediate fix:
 ```bash
 python -m pip install pyyaml
 ```
+
+## Shared-left fan-out reuse (`A @ B`, `A @ C`, ...)
+
+### Goal
+
+Add an explicit left-operand reuse path for sibling `matmul` ops that share the same
+left operand `A` inside one step, for example:
+
+- `Q = X @ Wq`
+- `K = X @ Wk`
+- `V = X @ Wv`
+
+The intended reuse is:
+
+- reuse the left Beaver mask `a_mask`
+- reuse the opened left residual `epsilon = A - a_mask`
+- keep `B / C / ...`, `delta`, and `C = a @ b` per-op
+
+### Implementation path
+
+1. `crypten/common/reuse_context.py`
+   - added `set/get/clear/use_a_group(...)`
+   - this is the explicit user / model annotation for shared-left fan-out reuse
+2. `crypten/gradients.py`
+   - `AutogradMatMul.forward()` now copies `get_current_a_group()` into the beaver tag as
+     `a_group`
+3. `crypten/mpc/primitives/beaver_reuse.py`
+   - `_normalize_tag(...)` now carries `a_group`
+   - `_base_descriptor(...)` uses a group-based key for operand `a` when `a_group` is set
+   - `_residual_key(...)` uses a group-based key for `epsilon` when `a_group` is set
+   - `_normalize_anchor(...)` carries `group` for operand `a`
+   - `_get_or_create_mask(...)` uses the grouped `a` base key so sibling matmuls share the
+     same left mask entry even when `op_uid` and `layer_id` differ
+4. `scripts/bench_reuse_shared_left_fanout.py`
+   - added a dedicated benchmark for `A @ B`, `A @ C`, ... shared-left fan-out reuse
+   - benchmark model: shared stem + multi-head Linear fan-out
+   - grouped fan-out heads run under `with use_a_group(...)`
+
+### Expected protocol effect
+
+For `k` sibling matmuls with the same left operand `A`:
+
+- baseline reveal tensors: `2k`
+- grouped-left reuse reveal tensors: `k + 1`
+
+because:
+
+- `epsilon = A - a_mask` is opened once
+- each branch still opens its own `delta_i = B_i - b_i`
+
+### Notes on scope
+
+- this path is explicit, not automatic
+- it is intended for model structures that know multiple sibling `matmul` ops share the same
+  left operand
+- it complements the existing forward/backward anchor reuse rather than replacing it
+
+### Backward scope note
+
+`a_group` is intentionally stripped from `backward_dX` tags in `crypten/gradients.py`.
+That prevents unrelated `grad_output` tensors from being treated as a shared-left operand.
+The group remains available on forward and `backward_dW`, where the left operand is still
+logically tied to the original shared activation `A` (or its transpose anchor).
+
+## SHARED_LEFT as the main reuse path for encrypted BERT training
+
+### Goal
+
+Promote the new shared-left reuse idea from a standalone fan-out benchmark into the
+actual encrypted GLUE / BERT training pipeline.
+
+The old `FIX_A` / `FIX_AB` paths remain in the lower-level runtime for compatibility,
+but the training and benchmark entrypoints now treat `SHARED_LEFT` as the primary
+experiment mode.
+
+### Code path
+
+1. `configs/default.yaml`
+   - changed default `cfg.mpc.reuse_mode` from `FIX_A` to `SHARED_LEFT`
+2. `crypten/mpc/primitives/beaver.py`
+   - default runtime fallback for reuse mode now uses `SHARED_LEFT`
+3. `crypten/gradients.py`
+   - default autograd fallback for reuse mode now uses `SHARED_LEFT`
+   - `backward_dW` skips the old forward/backward anchor path when `reuse_mode == SHARED_LEFT`
+   - `backward_dX` strips `a_group` to avoid falsely treating `grad_output` as a shared-left operand
+4. `crypten/nn/module.py`
+   - `Linear.forward()` and `Gemm.forward()` honor an injected `beaver_a_group`
+   - grouped modules run their matmul under `use_a_group(...)`
+5. `examples/text-classification/run_glue_private_mpc_lora_train.py`
+   - parser default for `--reuse_mode` changed to `SHARED_LEFT`
+   - added `--shared_left_min_fanout`
+   - added `--shared_left_log_groups`
+   - added `_annotate_shared_left_groups_crypten_model(...)`
+   - after `ct.nn.from_pytorch(...).encrypt()`, the CrypTen graph is scanned for sibling
+     `Gemm` / `Linear` nodes with the same left input and compatible left transform
+   - grouped nodes are annotated with:
+     - `beaver_a_group`
+     - `beaver_layer_tag`
+   - shared-left grouping summary is logged at startup and saved into
+     `train_eval_summary.json`
+6. `scripts/bench_reuse_shared_left_fanout.py`
+   - simplified to compare only:
+     - `baseline`
+     - `shared_left`
+
+### Why graph-level auto-grouping is needed
+
+The encrypted training script converts the HuggingFace PyTorch model into a CrypTen graph
+through `ct.nn.from_pytorch(...)`.
+
+At that point, original PyTorch module names such as `query`, `key`, `value` are no longer
+reliable grouping anchors. The robust place to detect shared-left opportunities is therefore
+inside the CrypTen graph:
+
+- inspect each `ct.nn.Graph`
+- collect `Gemm` / `Linear` consumers by their first input name
+- only form a reuse group when fan-out >= `shared_left_min_fanout`
+- also separate groups by left transform (`identity` vs `transpose`) so `A` and `A^T`
+  are never mixed into one reuse group
+
+This is the path now used for encrypted BERT / GLUE training.
+
+### Expected effect in BERT-like models
+
+Typical opportunities include:
+
+- attention Q / K / V projections: same hidden state, multiple sibling projections
+- sibling classifier heads or other explicit fan-out branches
+- backward weight-gradient matmuls for those sibling branches
+
+The main counters that should move under `SHARED_LEFT` are:
+
+- `a_base_cache_hit`
+- `residual_cache_hit`
+- `beaver_revealed_tensors`
+- communication `bytes`
+
+The main runtime metric remains:
+
+- `step_time_s`
+
+### Runtime note
+
+The grouping is explicit and step-scoped:
+
+- only applies when `--experimental_reuse_mask --reuse_mode SHARED_LEFT` are enabled
+- only affects grouped sibling matmuls that actually share one left operand
+- does not require the old `FIX_A` / `FIX_AB` reasoning at the training-entry level

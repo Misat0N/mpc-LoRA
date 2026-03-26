@@ -125,6 +125,7 @@ class BeaverReuseCache:
             "pass_name": tag.get("pass_name", "untagged"),
             "op_uid": tag.get("op_uid", -1),
             "tensor_shapes_signature": tag.get("tensor_shapes_signature"),
+            "a_group": tag.get("a_group"),
             "a_anchor": tag.get("a_anchor"),
             "b_anchor": tag.get("b_anchor"),
             "epsilon_anchor": tag.get("epsilon_anchor"),
@@ -161,13 +162,24 @@ class BeaverReuseCache:
         self.begin_step(step_id)
 
     @staticmethod
-    def _base_descriptor(tag, operand, device, pass_name=None):
+    def _base_descriptor(tag, operand, device, shape, pass_name=None):
+        pass_name = pass_name if pass_name is not None else tag.get("pass_name")
+        if operand == "a" and tag.get("a_group") is not None:
+            return (
+                "mask_group",
+                tag.get("step_id"),
+                pass_name,
+                operand,
+                str(device),
+                tag.get("a_group"),
+                BeaverReuseCache._normalize_shape(shape),
+            )
         return (
             "mask_base",
             tag.get("step_id"),
             tag.get("layer_id"),
             tag.get("op_uid"),
-            pass_name if pass_name is not None else tag.get("pass_name"),
+            pass_name,
             operand,
             str(device),
         )
@@ -176,14 +188,19 @@ class BeaverReuseCache:
     def _normalize_anchor(anchor, tag, default_operand):
         if not isinstance(anchor, dict):
             return None
+        operand = anchor.get("operand", default_operand)
         return {
             "step_id": anchor.get("step_id", tag.get("step_id")),
             "layer_id": anchor.get("layer_id", tag.get("layer_id")),
             "op_uid": anchor.get("op_uid", tag.get("op_uid")),
             "pass_name": anchor.get("pass_name", "forward"),
-            "operand": anchor.get("operand", default_operand),
+            "operand": operand,
             "residual": anchor.get("residual"),
             "transform": anchor.get("transform", "identity"),
+            "group": anchor.get(
+                "group",
+                tag.get("a_group") if operand == "a" else None,
+            ),
         }
 
     @staticmethod
@@ -277,6 +294,7 @@ class BeaverReuseCache:
         self._activate_step_from_tag(normalized_tag)
         shape = self._normalize_shape(shape)
         device = self._normalize_device(device)
+
         anchor_name = f"{operand}_anchor"
         anchor = self._normalize_anchor(
             normalized_tag.get(anchor_name), normalized_tag, default_operand=operand
@@ -284,43 +302,48 @@ class BeaverReuseCache:
         counter_prefix = "a" if operand == "a" else "b"
 
         if anchor is None:
-            base_key = self._base_descriptor(normalized_tag, operand, device)
-            if base_key in self._base_masks:
+            base_key = self._base_descriptor(normalized_tag, operand, device, shape)
+            entry = self._base_masks.get(base_key)
+            if entry is not None:
                 increment_perf_counter(f"{counter_prefix}_cache_hit")
                 increment_perf_counter(f"{counter_prefix}_base_cache_hit")
-                entry = self._base_masks[base_key]
                 self._register_entry(entry, cache_key=(base_key, "identity"))
                 return entry.shared
+
             increment_perf_counter(f"{counter_prefix}_cache_miss")
             increment_perf_counter(f"{counter_prefix}_base_cache_miss")
             entry = self._create_and_register_base_mask(base_key, shape, device=device)
             return entry.shared
 
+        source_shape = self._infer_source_shape(shape, anchor["transform"])
         source_tag = {
             "step_id": anchor["step_id"],
             "layer_id": anchor["layer_id"],
             "op_uid": anchor["op_uid"],
             "pass_name": anchor["pass_name"],
+            "a_group": anchor["group"] if anchor["operand"] == "a" else None,
         }
         source_base_key = self._base_descriptor(
-            source_tag, anchor["operand"], device, pass_name=anchor["pass_name"]
+            source_tag,
+            anchor["operand"],
+            device,
+            source_shape,
+            pass_name=anchor["pass_name"],
         )
 
         source_entry = self._base_masks.get(source_base_key)
         if source_entry is None:
-            source_shape = self._infer_source_shape(shape, anchor["transform"])
             source_entry = self._create_and_register_base_mask(
                 source_base_key, source_shape, device=device
             )
 
         derived_key = (source_base_key, anchor["transform"])
         entry = self._derived_masks.get(derived_key)
-        if entry is not None:
-            if entry.plain.size() == torch.Size(shape):
-                increment_perf_counter(f"{counter_prefix}_cache_hit")
-                increment_perf_counter(f"{counter_prefix}_derived_cache_hit")
-                self._register_entry(entry, cache_key=derived_key)
-                return entry.shared
+        if entry is not None and entry.plain.size() == torch.Size(shape):
+            increment_perf_counter(f"{counter_prefix}_cache_hit")
+            increment_perf_counter(f"{counter_prefix}_derived_cache_hit")
+            self._register_entry(entry, cache_key=derived_key)
+            return entry.shared
 
         transformed_plain = self._apply_plain_transform(source_entry.plain, anchor["transform"])
         if transformed_plain.size() != torch.Size(shape):
@@ -330,11 +353,13 @@ class BeaverReuseCache:
             entry = self._derive_mask_entry(
                 source_entry, anchor["transform"], transformed_plain=transformed_plain
             )
+
         self._derived_masks[derived_key] = entry
         increment_perf_counter(f"{counter_prefix}_cache_miss")
         increment_perf_counter(f"{counter_prefix}_derived_generated")
         self._register_entry(entry, cache_key=derived_key)
         return entry.shared
+
 
     def get_or_create_A(self, shape, dtype, device, tag):
         del dtype
@@ -419,6 +444,15 @@ class BeaverReuseCache:
 
     @staticmethod
     def _residual_key(tag, pass_name, residual_name):
+        group_id = tag.get("a_group", tag.get("group"))
+        if residual_name == "epsilon" and group_id is not None:
+            return (
+                "residual_group",
+                tag.get("step_id"),
+                pass_name,
+                residual_name,
+                group_id,
+            )
         return (
             "residual",
             tag.get("step_id"),

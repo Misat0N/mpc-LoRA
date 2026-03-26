@@ -101,3 +101,27 @@ def next_beaver_op_uid():
     _TLS.beaver_op_uid = op_uid + 1
     return op_uid
 
+
+def set_current_a_group(group):
+    _TLS.current_a_group = group
+
+
+def get_current_a_group():
+    return _get_tls_attr("current_a_group")
+
+
+def clear_current_a_group():
+    _clear_tls_attr("current_a_group")
+
+
+@contextmanager
+def use_a_group(group):
+    previous = get_current_a_group()
+    set_current_a_group(group)
+    try:
+        yield
+    finally:
+        if previous is None:
+            clear_current_a_group()
+        else:
+            set_current_a_group(previous)

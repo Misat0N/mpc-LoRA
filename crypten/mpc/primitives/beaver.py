@@ -132,13 +132,13 @@ def _beaver_from_provider(op, x, y, *args, **kwargs):
 def _beaver_with_reuse(op, x, y, *args, **kwargs):
     tag = _normalize_beaver_tag(op, x, y)
     reuse_cache = get_beaver_reuse_cache()
-    reuse_mode = str(getattr(cfg.mpc, "reuse_mode", "FIX_A")).upper()
+    reuse_mode = str(getattr(cfg.mpc, "reuse_mode", "SHARED_LEFT")).upper()
 
     a = reuse_cache.get_or_create_A(x.size(), x.share.dtype, x.device, tag)
     if reuse_mode == "FIX_AB":
         b = reuse_cache.get_or_create_B(y.size(), y.share.dtype, y.device, tag)
         cache_c = True
-    elif reuse_mode == "FIX_A":
+    elif reuse_mode in {"FIX_A", "SHARED_LEFT"}:
         b = reuse_cache.create_fresh_B(y.size(), y.share.dtype, y.device)
         cache_c = False
     else:

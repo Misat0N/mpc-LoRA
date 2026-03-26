@@ -13,6 +13,7 @@ import crypten
 import torch
 
 from .common.reuse_context import (
+    get_current_a_group,
     get_current_layer_tag,
     get_current_reuse_step,
     next_beaver_op_uid,
@@ -759,6 +760,7 @@ class AutogradMatMul(AutogradFunction):
             "layer_id": layer_tag,
             "op_name": "matmul",
             "op_uid": next_beaver_op_uid(),
+            "a_group": get_current_a_group(),
         }
         forward_tag = AutogradMatMul._build_beaver_tag(
             base_tag, "forward", input, other
@@ -797,18 +799,25 @@ class AutogradMatMul(AutogradFunction):
             "residual": "epsilon",
             "transform": "transpose",
         }
+        reuse_mode = str(getattr(crypten.cfg.mpc, "reuse_mode", "SHARED_LEFT")).upper()
         grad_input_tag = AutogradMatMul._build_beaver_tag(
             base_tag, "backward_dX", grad_output, grad_input_right
         )
+        grad_weight_tag_kwargs = {}
+        if reuse_mode != "SHARED_LEFT":
+            grad_weight_tag_kwargs.update(
+                a_anchor=forward_anchor_a,
+                epsilon_anchor=forward_anchor_eps,
+            )
         grad_weight_tag = AutogradMatMul._build_beaver_tag(
             base_tag,
             "backward_dW",
             grad_weight_left,
             grad_output,
-            a_anchor=forward_anchor_a,
-            epsilon_anchor=forward_anchor_eps,
+            **grad_weight_tag_kwargs,
         )
-        reuse_mode = str(getattr(crypten.cfg.mpc, "reuse_mode", "FIX_A")).upper()
+        if grad_input_tag is not None:
+            grad_input_tag.pop("a_group", None)
         if grad_input_tag is not None and reuse_mode == "FIX_AB":
             grad_input_tag["b_anchor"] = {
                 "pass_name": "forward",

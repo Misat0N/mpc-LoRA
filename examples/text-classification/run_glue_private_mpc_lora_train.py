@@ -18,6 +18,7 @@
 
 import argparse
 import builtins
+from collections import defaultdict
 import json
 import logging
 import math
@@ -194,6 +195,8 @@ def _new_reuse_runtime_profile():
         "c_cache_probe_miss": [],
         "c_cache_bypassed": [],
         "c_fresh_generated": [],
+        "residual_cache_hit": [],
+        "residual_cache_miss": [],
         "residual_anchor_hit": [],
         "residual_anchor_miss": [],
     }
@@ -205,7 +208,7 @@ def _finalize_reuse_runtime_profile(profile):
 
 def _configure_reuse_experiment(args):
     cfg.mpc.experimental_reuse_mask = args.experimental_reuse_mask
-    cfg.mpc.reuse_mode = args.reuse_mode
+    cfg.mpc.reuse_mode = str(args.reuse_mode).upper()
     cfg.mpc.reuse_scope = "STEP"
     cfg.mpc.reuse_op_types = ["matmul"]
     cfg.mpc.reuse_tagging = True
@@ -228,6 +231,74 @@ def _synchronize_timing_device(device):
         device_type = None
     if device_type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _is_shared_left_groupable_module(module):
+    return isinstance(module, (ct.nn.Gemm, ct.nn.Linear))
+
+
+def _shared_left_operand_transform(module):
+    if isinstance(module, ct.nn.Gemm):
+        return "transpose" if getattr(module, "trans_a", False) else "identity"
+    return "identity"
+
+
+def _annotate_shared_left_groups_crypten_model(model, min_fanout=2):
+    summary = {
+        "num_graphs": 0,
+        "num_groups": 0,
+        "num_grouped_modules": 0,
+        "groups": [],
+    }
+    if min_fanout < 2:
+        min_fanout = 2
+
+    for graph_name, graph in model.named_modules():
+        if not isinstance(graph, ct.nn.Graph):
+            continue
+        summary["num_graphs"] += 1
+        consumers_by_left_input = defaultdict(list)
+        for node_name, input_names in graph._graph.items():
+            module = graph._modules.get(node_name)
+            if module is None or not _is_shared_left_groupable_module(module):
+                continue
+            if len(input_names) == 0:
+                continue
+            left_input_name = input_names[0]
+            left_input_module = graph._modules.get(left_input_name)
+            if isinstance(left_input_module, ct.nn.Parameter):
+                continue
+            left_transform = _shared_left_operand_transform(module)
+            group_key = (left_input_name, left_transform)
+            consumers_by_left_input[group_key].append((node_name, module))
+
+        for (left_input_name, left_transform), consumers in consumers_by_left_input.items():
+            if len(consumers) < min_fanout:
+                continue
+            graph_prefix = graph_name if graph_name else "root"
+            group_tag = f"shared_left:{graph_prefix}:{left_input_name}:{left_transform}"
+            group_nodes = []
+            for node_name, module in consumers:
+                setattr(module, "beaver_a_group", group_tag)
+                setattr(module, "beaver_layer_tag", f"{graph_prefix}:{node_name}")
+                group_nodes.append(node_name)
+            summary["num_groups"] += 1
+            summary["num_grouped_modules"] += len(consumers)
+            summary["groups"].append(
+                {
+                    "graph": graph_prefix,
+                    "left_input": left_input_name,
+                    "left_transform": left_transform,
+                    "fanout": len(consumers),
+                    "nodes": group_nodes,
+                }
+            )
+
+    summary["groups"] = sorted(
+        summary["groups"],
+        key=lambda item: (item["graph"], item["left_input"]),
+    )
+    return summary
 
 
 def _safe_metric_compute(metric, steps, rank, phase):
@@ -692,9 +763,28 @@ def parse_args():
     parser.add_argument(
         "--reuse_mode",
         type=str,
-        default="FIX_A",
-        choices=["FIX_A", "FIX_AB"],
-        help="Beaver reuse mode when --experimental_reuse_mask is enabled.",
+        default="SHARED_LEFT",
+        choices=["SHARED_LEFT", "FIX_A", "FIX_AB"],
+        help=(
+            "Beaver reuse mode when --experimental_reuse_mask is enabled. "
+            "SHARED_LEFT is the main path: reuse left Beaver mask / epsilon across sibling matmuls "
+            "that share the same left operand."
+        ),
+    )
+    parser.add_argument(
+        "--shared_left_min_fanout",
+        type=int,
+        default=2,
+        help=(
+            "Minimum number of sibling Gemm/Linear consumers with the same left input required "
+            "to auto-annotate a shared-left reuse group in the CrypTen graph."
+        ),
+    )
+    parser.add_argument(
+        "--shared_left_log_groups",
+        type=int,
+        default=12,
+        help="Maximum number of detected shared-left groups to print in startup logs.",
     )
     parser.add_argument(
         "--reuse_profile",
@@ -1050,17 +1140,45 @@ def main():
     )
     logger.info("[rank %s] cfg after crypten init=%s", rank, _cfg_snapshot())
     logger.info(
-        "[rank %s] reuse config: experimental=%s mode=%s profile=%s log_every=%s",
+        "[rank %s] reuse config: experimental=%s mode=%s profile=%s log_every=%s shared_left_min_fanout=%s",
         rank,
         args.experimental_reuse_mask,
         args.reuse_mode,
         args.reuse_profile,
         args.reuse_log_every_steps,
+        args.shared_left_min_fanout,
     )
     # print("done")
     # exit()
     dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
     private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).encrypt().to(device)
+    shared_left_group_summary = None
+    if args.experimental_reuse_mask and str(args.reuse_mode).upper() == "SHARED_LEFT":
+        shared_left_group_summary = _annotate_shared_left_groups_crypten_model(
+            private_model, min_fanout=args.shared_left_min_fanout
+        )
+        if rank == 0:
+            logger.info(
+                "[shared-left] grouped_graphs=%s groups=%s grouped_modules=%s min_fanout=%s",
+                shared_left_group_summary["num_graphs"],
+                shared_left_group_summary["num_groups"],
+                shared_left_group_summary["num_grouped_modules"],
+                args.shared_left_min_fanout,
+            )
+            preview_limit = max(0, args.shared_left_log_groups)
+            for group in shared_left_group_summary["groups"][:preview_limit]:
+                logger.info(
+                    "[shared-left] graph=%s left_input=%s left_transform=%s fanout=%s nodes=%s",
+                    group["graph"],
+                    group["left_input"],
+                    group["left_transform"],
+                    group["fanout"],
+                    group["nodes"],
+                )
+            if shared_left_group_summary["num_groups"] == 0:
+                logger.warning(
+                    "[shared-left] no eligible grouped Gemm/Linear fan-out was detected in the CrypTen graph"
+                )
     private_model.train()
     lr = args.learning_rate
     optimizer = ct.optim.SGD(private_model.parameters(), lr=lr, momentum=args.momentum)
@@ -1314,6 +1432,12 @@ def main():
             reuse_runtime_profile["c_fresh_generated"].append(
                 beaver_delta.get("c_fresh_generated", 0)
             )
+            reuse_runtime_profile["residual_cache_hit"].append(
+                beaver_delta.get("residual_cache_hit", 0)
+            )
+            reuse_runtime_profile["residual_cache_miss"].append(
+                beaver_delta.get("residual_cache_miss", 0)
+            )
             reuse_runtime_profile["residual_anchor_hit"].append(
                 beaver_delta.get("residual_anchor_hit", 0)
             )
@@ -1327,7 +1451,8 @@ def main():
                     "rounds=%s bytes=%s triple=%s reveals=%s reveal_tensors=%s "
                     "a_base_hit=%s a_base_miss=%s a_der_hit=%s a_der_new=%s "
                     "b_base_hit=%s b_base_miss=%s b_der_hit=%s b_der_new=%s b_fresh=%s "
-                    "c_hit=%s c_miss=%s c_bypass=%s c_fresh=%s anchor_hit=%s anchor_miss=%s",
+                    "c_hit=%s c_miss=%s c_bypass=%s c_fresh=%s "
+                    "res_hit=%s res_miss=%s anchor_hit=%s anchor_miss=%s",
                     global_step + 1,
                     prep_end - prep_start,
                     forward_end - forward_start,
@@ -1352,6 +1477,8 @@ def main():
                     beaver_delta.get("c_cache_probe_miss", 0),
                     beaver_delta.get("c_cache_bypassed", 0),
                     beaver_delta.get("c_fresh_generated", 0),
+                    beaver_delta.get("residual_cache_hit", 0),
+                    beaver_delta.get("residual_cache_miss", 0),
                     beaver_delta.get("residual_anchor_hit", 0),
                     beaver_delta.get("residual_anchor_miss", 0),
                 )
@@ -1502,6 +1629,7 @@ def main():
             "eval_max_steps": args.eval_max_steps,
             "experimental_reuse_mask": args.experimental_reuse_mask,
             "reuse_mode": args.reuse_mode,
+            "shared_left_group_summary": shared_left_group_summary,
             "reuse_profile_summary": reuse_profile_summary,
         }
         summary_path = os.path.join(args.output_dir, "train_eval_summary.json")

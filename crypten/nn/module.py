@@ -16,7 +16,7 @@ import crypten
 import torch
 import torch.onnx.symbolic_helper as sym_help
 from crypten.common.functions.pooling import _adaptive_pool2d_helper
-from crypten.common.reuse_context import use_layer_tag
+from crypten.common.reuse_context import use_a_group, use_layer_tag
 from crypten.config import cfg
 
 class Module:
@@ -2027,7 +2027,19 @@ class Gemm(Module):
             a = a.t()
         if self.trans_b:
             b = b.t()
-        output = a.matmul(b).mul(self.alpha)
+        layer_tag = getattr(self, "beaver_layer_tag", None)
+        group_tag = getattr(self, "beaver_a_group", None)
+        if layer_tag is None and group_tag is None:
+            output = a.matmul(b).mul(self.alpha)
+        else:
+            if layer_tag is None:
+                layer_tag = f"gemm:{id(self)}"
+            with use_layer_tag(layer_tag):
+                if group_tag is None:
+                    output = a.matmul(b).mul(self.alpha)
+                else:
+                    with use_a_group(group_tag):
+                        output = a.matmul(b).mul(self.alpha)
         output = output.add(c.mul(self.beta))
         return output
 
@@ -2074,8 +2086,13 @@ class Linear(Module):
 
     def forward(self, x):
         layer_tag = f"linear:{id(self)}"
+        group_tag = getattr(self, "beaver_a_group", None)
         with use_layer_tag(layer_tag):
-            output = x.matmul(self.weight.t())
+            if group_tag is None:
+                output = x.matmul(self.weight.t())
+            else:
+                with use_a_group(group_tag):
+                    output = x.matmul(self.weight.t())
         if hasattr(self, "bias"):
             output = output.add(self.bias)
         return output

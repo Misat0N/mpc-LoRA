@@ -72,9 +72,10 @@ mpc:
   provider: "TFP"
   protocol: "beaver"
   # INSECURE PERFORMANCE EXPERIMENT:
-  # reuse Beaver masks (A / optional B) to measure pure performance impact.
+  # reuse Beaver left masks / opened epsilon across sibling matmuls that
+  # share the same left operand inside one training step.
   experimental_reuse_mask: False
-  reuse_mode: "FIX_A"
+  reuse_mode: "SHARED_LEFT"
   reuse_scope: "STEP"
   reuse_op_types: ["matmul"]
   reuse_tagging: True

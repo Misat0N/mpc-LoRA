@@ -3219,8 +3219,10 @@ class LayerNormalization(Module):
         # layernorm input: torch.Size([1, l, 768]), scale: torch.Size([768]), bias: torch.Size([768])
         input, scale, bias = x
         mean = input.mean(dim=self.axis, keepdim=True)
-        inv_sd = (input.var(dim=self.axis, keepdim=True) + self.eps).inv_sqrt()
-        out = (input - mean) * inv_sd
+        centered = input - mean
+        variance = centered.square().mean(dim=self.axis, keepdim=True)
+        inv_sd = (variance + self.eps).inv_sqrt()
+        out = centered * inv_sd
 
         if scale is not None:
             out = out * scale

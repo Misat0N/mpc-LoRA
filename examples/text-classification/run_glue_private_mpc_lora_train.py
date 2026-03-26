@@ -365,6 +365,24 @@ def _collect_train_numeric_probe(rank, logits_enc, loss_enc, y_onehot, preview_l
     return summary
 
 
+def _collect_train_pre_backward_numeric_probe(rank, logits_enc, loss_enc, y_onehot, preview_limit=8):
+    logits_plain = logits_enc.get_plain_text().detach().cpu()
+    revealed_loss = float(loss_enc.get_plain_text().item())
+    labels_plain = y_onehot.detach().cpu()
+    recomputed_mse = float(((logits_plain - labels_plain) * (logits_plain - labels_plain)).mean().item())
+    summary = {
+        "revealed_logits_preview": _tensor_preview(logits_plain, limit=preview_limit),
+        "revealed_logits_stats": _tensor_stats(logits_plain),
+        "label_onehot_preview": _tensor_preview(labels_plain, limit=preview_limit),
+        "revealed_loss": revealed_loss,
+        "recomputed_mse_from_revealed_logits": recomputed_mse,
+        "loss_minus_recomputed": float(revealed_loss - recomputed_mse),
+    }
+    if rank == 0:
+        logger.info("[numeric-probe] train_pre_backward_compare=%s", summary)
+    return summary
+
+
 def _delta_dict(after, before):
     keys = set(before.keys()) | set(after.keys())
     return {key: after.get(key, 0) - before.get(key, 0) for key in keys}
@@ -1581,6 +1599,10 @@ def main():
 
         # optimizer (create once on first step)
         logger.info("[rank %s] train_step=%03d loss_snapshot=%s", rank, global_step, _loss_snapshot(loss_enc))
+        if args.debug_numeric_probe and global_step == 0:
+            numeric_probe_summary["train_pre_backward_compare"] = _collect_train_pre_backward_numeric_probe(
+                rank, logits_enc, loss_enc, y_onehot
+            )
 
         if global_step == 1:
             logger.info("[rank %s] train_step=%03d cfg consistency check start", rank, global_step)

@@ -192,7 +192,7 @@ def var(self, *args, **kwargs):
 
     # Determine divisor
     divisor = self.nelement() // result.nelement()
-    if not unbiased:
+    if unbiased:
         divisor -= 1
 
     # Compute mean square error

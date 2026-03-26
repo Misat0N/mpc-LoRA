@@ -1814,9 +1814,26 @@ class Dropout(Module):
                 "CrypTen Dropout module does not support inplace computation."
             )
 
+    @staticmethod
+    def _parse_ratio(ratio, default=0.5):
+        if ratio is None:
+            return default
+        if hasattr(ratio, "get_plain_text"):
+            ratio = ratio.get_plain_text()
+        if torch.is_tensor(ratio):
+            assert ratio.numel() == 1, f"Dropout ratio must be scalar, not shape={tuple(ratio.size())}"
+            ratio = ratio.detach().cpu().item()
+        return float(ratio)
+
     def forward(self, input):
-        x, ratio, training_mode = input
-        return x.dropout(p=ratio, training=training_mode)
+        if isinstance(input, (list, tuple)):
+            x = input[0]
+            ratio = input[1] if len(input) >= 2 else 0.5
+        else:
+            x = input
+            ratio = 0.5
+        ratio = self._parse_ratio(ratio)
+        return x.dropout(p=ratio, training=self.training)
 
     @staticmethod
     def from_onnx(attributes=None):

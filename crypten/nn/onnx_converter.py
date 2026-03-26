@@ -366,9 +366,8 @@ def _onnx_crypten_dropout(g, input, p, train):
     CrypTen models, and so the Dropout module needs to be included in the
     CrypTen-specific conversion.
     """
-    ratio = g.op("Constant", value_t=torch.tensor(p))
-    training_mode = g.op("Constant", value_t=torch.tensor(train))
-    r, _ = g.op("Dropout", input, ratio, training_mode, outputs=2)
+    ratio = g.op("Constant", value_t=torch.tensor(float(p)))
+    r, _ = g.op("Dropout", input, ratio, outputs=2)
     return r
 
 

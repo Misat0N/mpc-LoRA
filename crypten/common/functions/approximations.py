@@ -621,6 +621,13 @@ def softmax(self, dim, **kwargs):
     if method == "ideal":
         return crypten.cryptensor(torch.softmax(self.get_plain_text(), dim=dim), device=self.device)
     if method == "reciprocal":
+        # Keep reciprocal softmax on a bounded domain to avoid exp blow-up
+        # when secure max approximation drifts during training.
+        if cfg.functions.softmax_ode_clip:
+            upper, lower = cfg.functions.softmax_ode_ub, cfg.functions.softmax_ode_lb
+            diff = crypten.cat([self - upper, lower - self]).relu().split(self.shape[0])
+            self = self + diff[1] - diff[0]
+
         maximum_value = self.max(dim, keepdim=True)[0]
         logits = self - maximum_value
         numerator = logits.exp()

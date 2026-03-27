@@ -1077,12 +1077,12 @@ def parse_args():
     parser.add_argument(
         "--ce_softmax_method",
         type=str,
-        default="reciprocal",
+        default="default",
         choices=["default", "reciprocal", "ode"],
         help=(
             "Softmax approximation to use inside CrypTen cross-entropy. "
-            "'default' keeps cfg.functions.softmax_method, while 'reciprocal' is typically "
-            "more stable than the global default 'ode' for CE training."
+            "'default' keeps cfg.functions.softmax_method. "
+            "Use 'reciprocal' only for explicit experiments."
         ),
     )
     parser.add_argument(
@@ -1239,6 +1239,11 @@ def main():
     logger.info("resolved seed=%s", args.seed)
     logger.info("resolved loss_type=%s", args.loss_type)
     logger.info("resolved ce_softmax_method=%s", args.ce_softmax_method)
+    if args.loss_type == "ce" and args.ce_softmax_method == "reciprocal":
+        logger.warning(
+            "[ce] softmax_method=reciprocal can still be numerically fragile in MPC fixed-point; "
+            "prefer --ce_softmax_method default for stable training."
+        )
     if args.quick_run:
         logger.info(
             "[quick-run] enabled: len=%s max_length=%s train_steps=%s train_samples=%s eval_samples=%s "

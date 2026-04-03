@@ -1925,8 +1925,21 @@ def main():
             inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
             attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
             token_type_enc = ct.cryptensor(token_type_ids).to(device)
-            with ct.no_grad():
-                outputs_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)
+            eval_step_id = None
+            if args.experimental_reuse_mask:
+                # Keep reuse scope aligned and bounded to one eval batch.
+                # Without a per-batch step id, residual cache can cross sample
+                # boundaries in eval and destabilize collectives.
+                eval_step_id = f"eval-{eval_steps}"
+                set_current_reuse_step(eval_step_id)
+                beaver_protocol.begin_reuse_step(eval_step_id)
+            try:
+                with ct.no_grad():
+                    outputs_enc = private_model(inputs_enc, attention_mask_enc, token_type_enc)
+            finally:
+                if args.experimental_reuse_mask:
+                    beaver_protocol.end_reuse_step(eval_step_id)
+                    clear_current_reuse_step()
 
             outputs = outputs_enc.get_plain_text().cpu()
             predictions = outputs.argmax(dim=-1) if not is_regression else outputs.squeeze()

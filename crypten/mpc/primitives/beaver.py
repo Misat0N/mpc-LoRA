@@ -8,7 +8,13 @@
 import crypten
 import crypten.communicator as comm
 import torch
-from crypten.common.reuse_context import get_current_beaver_tag
+from crypten.common.reuse_context import (
+    get_current_a_group,
+    get_current_beaver_tag,
+    get_current_layer_tag,
+    get_current_reuse_step,
+    next_beaver_op_uid,
+)
 from crypten.common.util import count_wraps
 from crypten.config import cfg
 from crypten.mpc.primitives.beaver_reuse import (
@@ -50,13 +56,17 @@ def _normalize_beaver_tag(op, x, y):
     tag = get_current_beaver_tag()
     if isinstance(tag, dict):
         return tag
+    layer_tag = get_current_layer_tag()
+    if layer_tag is None:
+        layer_tag = "untagged"
     return {
-        "step_id": None,
-        "layer_id": "untagged",
+        "step_id": get_current_reuse_step(default=None),
+        "layer_id": layer_tag,
         "op_name": op,
-        "pass_name": "untagged",
-        "op_uid": id(x) ^ id(y),
+        "pass_name": "forward_nograd",
+        "op_uid": next_beaver_op_uid(),
         "tensor_shapes_signature": (tuple(x.size()), tuple(y.size())),
+        "a_group": get_current_a_group(),
     }
 
 

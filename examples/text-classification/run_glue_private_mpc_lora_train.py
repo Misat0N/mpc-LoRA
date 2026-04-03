@@ -1922,6 +1922,10 @@ def main():
         global_step,
         time.time() - train_start_time,
     )
+    # Phase barrier: private eval / decrypt also use collectives. Without an
+    # explicit sync here, one rank can leave training and enter the next phase
+    # while another rank is still in the previous collective-heavy section.
+    ct.barrier()
 
     private_eval_metric = {"skipped": True, "reason": "disabled"}
     if not args.skip_private_eval:
@@ -1964,6 +1968,9 @@ def main():
     elif rank == 0:
         logger.info("[eval-private] skipped by flag --skip_private_eval")
 
+    # Keep all ranks aligned before entering decrypt / plaintext recovery.
+    ct.barrier()
+
     # Step 3B: recover a plaintext model and run plaintext evaluation.
     plain_eval_metric = {"skipped": True, "reason": "disabled"}
     plain_steps = 0
@@ -1975,6 +1982,7 @@ def main():
         private_model.decrypt()
         # Keep decrypted CrypTen parameters on CPU so to_pytorch() can assign storage safely.
         private_model = private_model.to("cpu")
+    ct.barrier()
     if rank == 0 and ((not args.skip_plain_eval) or (args.output_dir is not None)):
         try:
             trained_model = _recover_plain_model_from_private(private_model, model, rank)

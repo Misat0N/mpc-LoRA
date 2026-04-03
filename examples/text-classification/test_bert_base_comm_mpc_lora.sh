@@ -23,6 +23,10 @@ LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-query,value}"
 LEARNING_RATE="${LEARNING_RATE:-5e-4}"
 MOMENTUM="${MOMENTUM:-0.9}"
+EXPERIMENTAL_REUSE_MASK="${EXPERIMENTAL_REUSE_MASK:-1}"
+REUSE_MODE="${REUSE_MODE:-SHARED_LEFT}"
+SHARED_LEFT_MIN_FANOUT="${SHARED_LEFT_MIN_FANOUT:-2}"
+SHARED_LEFT_LOG_GROUPS="${SHARED_LEFT_LOG_GROUPS:-12}"
 
 RUN_TAG="${RUN_TAG:-mpc_lora_$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="eval_private/${TASK_NAME}/${RUN_TAG}"
@@ -43,6 +47,14 @@ if [[ "${PRINT_COMM_COST:-0}" == "1" ]]; then
 fi
 if [[ "${ALLOW_SPAM_LOGS:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--allow_spam_logs)
+fi
+if [[ "${EXPERIMENTAL_REUSE_MASK}" == "1" ]]; then
+  EXTRA_ARGS+=(
+    --experimental_reuse_mask
+    --reuse_mode "${REUSE_MODE}"
+    --shared_left_min_fanout "${SHARED_LEFT_MIN_FANOUT}"
+    --shared_left_log_groups "${SHARED_LEFT_LOG_GROUPS}"
+  )
 fi
 
 echo "[mpc-lora] output_dir=${OUT_DIR}"

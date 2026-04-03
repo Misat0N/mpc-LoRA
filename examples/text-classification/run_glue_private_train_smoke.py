@@ -17,6 +17,7 @@
 """Testing a Transformers model in priavte for sequence classification on GLUE."""
 
 import argparse
+from collections import defaultdict
 import json
 import logging
 import os
@@ -46,7 +47,9 @@ from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 
 import crypten as ct
+from crypten.common.reuse_context import clear_current_reuse_step, set_current_reuse_step
 from crypten.config import cfg
+from crypten.mpc.primitives import beaver as beaver_protocol
 from multiprocess_launcher import MultiProcessLauncher
 
 
@@ -133,6 +136,82 @@ def _loss_snapshot(loss_tensor):
     return snapshot
 
 
+def _configure_reuse_experiment(args):
+    cfg.mpc.experimental_reuse_mask = args.experimental_reuse_mask
+    cfg.mpc.reuse_mode = str(args.reuse_mode).upper()
+    cfg.mpc.reuse_scope = "STEP"
+    cfg.mpc.reuse_op_types = ["matmul"]
+    cfg.mpc.reuse_tagging = True
+
+
+def _is_shared_left_groupable_module(module):
+    return isinstance(module, (ct.nn.Gemm, ct.nn.Linear, ct.nn.MatMul))
+
+
+def _shared_left_operand_transform(module):
+    if isinstance(module, ct.nn.Gemm):
+        return "transpose" if getattr(module, "trans_a", False) else "identity"
+    return "identity"
+
+
+def _annotate_shared_left_groups_crypten_model(model, min_fanout=2):
+    summary = {
+        "num_graphs": 0,
+        "num_groups": 0,
+        "num_grouped_modules": 0,
+        "groups": [],
+    }
+    if min_fanout < 2:
+        min_fanout = 2
+
+    for graph_name, graph in model.named_modules():
+        if not isinstance(graph, ct.nn.Graph):
+            continue
+        summary["num_graphs"] += 1
+        consumers_by_left_input = defaultdict(list)
+        for node_name, input_names in graph._graph.items():
+            module = graph._modules.get(node_name)
+            if module is None or not _is_shared_left_groupable_module(module):
+                continue
+            if len(input_names) == 0:
+                continue
+            left_input_name = input_names[0]
+            left_input_module = graph._modules.get(left_input_name)
+            if isinstance(left_input_module, ct.nn.Parameter):
+                continue
+            left_transform = _shared_left_operand_transform(module)
+            group_key = (left_input_name, left_transform)
+            consumers_by_left_input[group_key].append((node_name, module))
+
+        for (left_input_name, left_transform), consumers in consumers_by_left_input.items():
+            if len(consumers) < min_fanout:
+                continue
+            graph_prefix = graph_name if graph_name else "root"
+            group_tag = f"shared_left:{graph_prefix}:{left_input_name}:{left_transform}"
+            group_nodes = []
+            for node_name, module in consumers:
+                setattr(module, "beaver_a_group", group_tag)
+                setattr(module, "beaver_layer_tag", f"{graph_prefix}:{node_name}")
+                group_nodes.append(node_name)
+            summary["num_groups"] += 1
+            summary["num_grouped_modules"] += len(consumers)
+            summary["groups"].append(
+                {
+                    "graph": graph_prefix,
+                    "left_input": left_input_name,
+                    "left_transform": left_transform,
+                    "fanout": len(consumers),
+                    "nodes": group_nodes,
+                }
+            )
+
+    summary["groups"] = sorted(
+        summary["groups"],
+        key=lambda item: (item["graph"], item["left_input"]),
+    )
+    return summary
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a text classification task")
     parser.add_argument(
@@ -201,6 +280,37 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the output.")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
+        "--experimental_reuse_mask",
+        action="store_true",
+        help="Enable the Beaver mask reuse performance experiment in CrypTen matmul.",
+    )
+    parser.add_argument(
+        "--reuse_mode",
+        type=str,
+        default="SHARED_LEFT",
+        choices=["SHARED_LEFT", "FIX_A", "FIX_AB"],
+        help=(
+            "Beaver reuse mode when --experimental_reuse_mask is enabled. "
+            "SHARED_LEFT is the main path: reuse left Beaver mask / epsilon across sibling matmuls "
+            "that share the same left operand."
+        ),
+    )
+    parser.add_argument(
+        "--shared_left_min_fanout",
+        type=int,
+        default=2,
+        help=(
+            "Minimum number of sibling Gemm/Linear/MatMul consumers with the same left input "
+            "required to auto-annotate a shared-left reuse group in the CrypTen graph."
+        ),
+    )
+    parser.add_argument(
+        "--shared_left_log_groups",
+        type=int,
+        default=12,
+        help="Maximum number of detected shared-left groups to print in startup logs.",
+    )
+    parser.add_argument(
         "--trust_remote_code",
         type=bool,
         default=False,
@@ -246,6 +356,7 @@ def parse_args():
 def main():
     script_start_time = time.time()
     args = parse_args()
+    _configure_reuse_experiment(args)
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_glue_private", args)
@@ -444,10 +555,43 @@ def main():
     rank = _get_rank()
     logger.info("[rank %s] crypten initialized=%s", rank, ct.is_initialized())
     logger.info("[rank %s] cfg after crypten init=%s", rank, _cfg_snapshot())
+    logger.info(
+        "[rank %s] reuse config: experimental=%s mode=%s shared_left_min_fanout=%s",
+        rank,
+        args.experimental_reuse_mask,
+        args.reuse_mode,
+        args.shared_left_min_fanout,
+    )
     # print("done")
     # exit()
     dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
     private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).encrypt().to(device)
+    if args.experimental_reuse_mask and str(args.reuse_mode).upper() == "SHARED_LEFT":
+        shared_left_group_summary = _annotate_shared_left_groups_crypten_model(
+            private_model, min_fanout=args.shared_left_min_fanout
+        )
+        if rank == 0:
+            logger.info(
+                "[shared-left] grouped_graphs=%s groups=%s grouped_modules=%s min_fanout=%s",
+                shared_left_group_summary["num_graphs"],
+                shared_left_group_summary["num_groups"],
+                shared_left_group_summary["num_grouped_modules"],
+                args.shared_left_min_fanout,
+            )
+            preview_limit = max(0, args.shared_left_log_groups)
+            for group in shared_left_group_summary["groups"][:preview_limit]:
+                logger.info(
+                    "[shared-left] graph=%s left_input=%s left_transform=%s fanout=%s nodes=%s",
+                    group["graph"],
+                    group["left_input"],
+                    group["left_transform"],
+                    group["fanout"],
+                    group["nodes"],
+                )
+            if shared_left_group_summary["num_groups"] == 0:
+                logger.warning(
+                    "[shared-left] no eligible grouped Gemm/Linear/MatMul fan-out was detected in the CrypTen graph"
+                )
     private_model.train()
     lr = 0.01
     optimizer = ct.optim.SGD(private_model.parameters(), lr=lr)
@@ -530,6 +674,10 @@ def main():
         if "token_type_ids" not in batch:
             logger.error("[rank %s] token_type_ids missing in batch. keys=%s", rank, sorted(batch.keys()))
             raise KeyError("token_type_ids")
+        step_id = step
+        if args.experimental_reuse_mask:
+            set_current_reuse_step(step_id)
+            beaver_protocol.begin_reuse_step(step_id)
         inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
         attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
         token_type_enc = ct.cryptensor(batch["token_type_ids"]).to(device)
@@ -578,6 +726,9 @@ def main():
         try:
             loss_enc.backward()
         except Exception:
+            if args.experimental_reuse_mask:
+                beaver_protocol.end_reuse_step(step_id)
+                clear_current_reuse_step()
             logger.exception(
                 "[rank %s] step=%03d backward_failed cfg=%s loss=%s",
                 rank,
@@ -591,12 +742,18 @@ def main():
         try:
             optimizer.step()
         except Exception:
+            if args.experimental_reuse_mask:
+                beaver_protocol.end_reuse_step(step_id)
+                clear_current_reuse_step()
             logger.exception("[rank %s] step=%03d optimizer_step_failed", rank, step)
             raise
         logger.info("[rank %s] step=%03d optimizer_step_done", rank, step)
 
         # reveal loss (ALL ranks must call get_plain_text / reveal)
         loss_plain = loss_enc.get_plain_text().item()
+        if args.experimental_reuse_mask:
+            beaver_protocol.end_reuse_step(step_id)
+            clear_current_reuse_step()
         logger.info("[rank %s] [train-smoke] step=%03d loss=%.6f", rank, step, loss_plain)
 
     if ct.communicator.get().get_rank() == 0:

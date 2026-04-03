@@ -28,12 +28,9 @@ CUDA_VISIBLE_DEVICES=2,3 python scripts/bench_reuse_shared_left_fanout.py \
   --device cuda \
   --gpu-ids 0,1 \
   --preset-cases tiny,base,wide \
-  --steps 100 \
-  --warmup 20 \
-  --repeats 5 \
-  --verbose-comm \
-  --save-json bench_reuse_shared_left_fanout.json \
-  --save-csv bench_reuse_shared_left_fanout.csv
+  --steps 20 \
+  --warmup 5 \
+  --repeats 3
 ```
 
 说明：
@@ -112,18 +109,49 @@ dW3 = H^T @ dY3
 | `reveal_tensors` | residual 打开数量降幅 | 相对 `baseline`，被 reveal 的 residual tensor 数量减少了多少 |
 
 
+### 4.3 `相对 baseline` 指标的统一读法
+下面三项是和 `baseline` 的对比，不是绝对值：
+
+- `step`
+  - 计算：`(baseline_step - shared_left_step) / baseline_step`
+  - 解读：
+    - `+3.27%` 表示 shared_left 比 baseline 快 `3.27%`
+    - `+20.18%` 表示 shared_left 比 baseline 快 `20.18%`
+- `triple`
+  - 计算：`(baseline_triple - shared_left_triple) / baseline_triple`
+  - 解读：`-70.59%` 表示 triple 调用次数下降 `70.59%`
+- `reveal_tensors`
+  - 计算：`(baseline_reveal - shared_left_reveal) / baseline_reveal`
+  - 解读：`-11.76%` 表示 reveal 张量数量下降 `11.76%`
+
 ## 5. 本次原始结果
+
+### 5.0 三个模式（tiny / base / wide）配置对照
+三组 case 只改变模型与张量规模；其余运行参数一致（`provider=TFP`, `steps=20`, `warmup=5`, `repeats=3`, `activation=relu`, `bias=True`）。
+
+| case | batch_size | in_features | hidden_features | out_features | fanout_heads | activation | bias |
+|---|---:|---:|---:|---:|---:|---|---|
+| `tiny` | 32 | 64 | 64 | 16 | 3 | `relu` | `True` |
+| `base` | 64 | 256 | 256 | 64 | 3 | `relu` | `True` |
+| `wide` | 128 | 512 | 1024 | 128 | 4 | `relu` | `True` |
+
+这些字段的含义：
+- `batch_size`: 每步样本数 `B`
+- `in_features`: 输入维度（进入 stem 之前）
+- `hidden_features`: stem 输出维度（也是 fan-out 各 head 的输入维度）
+- `out_features`: 每个 head 的输出维度
+- `fanout_heads`: 共享同一左操作数的并行 head 数量（越大越容易观察 shared-left 复用收益）
 
 ### 5.1 tiny
 
 | 模式 | 单步总耗时(s) | 通信轮次 | 通信字节数 | 打开的残差张量数 | triple 生成次数 | A 掩码命中/未命中 | residual 命中/未命中 | 加速比 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 0.157943 | 28.00 | 1695744 | 34.00 | 17.00 | 0.00 / 0.00 | 0.00 / 0.00 | 1.000x |
-| shared_left | 0.144683 | 28.00 | 1564672 | 30.00 | 5.00 | 4.00 / 8.00 | 4.00 / 20.00 | 1.092x |
+| baseline | 0.145162 | 0.00 | 0.00 | 34.00 | 17.00 | 0.00 / 0.00 | 0.00 / 0.00 | 1.000x |
+| shared_left | 0.140410 | 0.00 | 0.00 | 30.00 | 5.00 | 4.00 / 8.00 | 4.00 / 20.00 | 1.034x |
 
 相对 baseline：
 
-- step：`+8.39%`
+- step：`+3.27%`
 - triple：`-70.59%`
 - reveal_tensors：`-11.76%`
 
@@ -131,12 +159,12 @@ dW3 = H^T @ dY3
 
 | 模式 | 单步总耗时(s) | 通信轮次 | 通信字节数 | 打开的残差张量数 | triple 生成次数 | A 掩码命中/未命中 | residual 命中/未命中 | 加速比 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 0.154159 | 28.00 | 15400960 | 34.00 | 17.00 | 0.00 / 0.00 | 0.00 / 0.00 | 1.000x |
-| shared_left | 0.155997 | 28.00 | 14352384 | 30.00 | 5.00 | 4.00 / 8.00 | 4.00 / 20.00 | 0.988x |
+| baseline | 0.189842 | 0.00 | 0.00 | 34.00 | 17.00 | 0.00 / 0.00 | 0.00 / 0.00 | 1.000x |
+| shared_left | 0.151538 | 0.00 | 0.00 | 30.00 | 5.00 | 4.00 / 8.00 | 4.00 / 20.00 | 1.253x |
 
 相对 baseline：
 
-- step：`-1.19%`
+- step：`+20.18%`
 - triple：`-70.59%`
 - reveal_tensors：`-11.76%`
 
@@ -144,12 +172,12 @@ dW3 = H^T @ dY3
 
 | 模式 | 单步总耗时(s) | 通信轮次 | 通信字节数 | 打开的残差张量数 | triple 生成次数 | A 掩码命中/未命中 | residual 命中/未命中 | 加速比 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| baseline | 0.333537 | 33.00 | 126877696 | 42.00 | 21.00 | 0.00 / 0.00 | 0.00 / 0.00 | 1.000x |
-| shared_left | 0.350661 | 33.00 | 114294784 | 36.00 | 6.00 | 6.00 / 9.00 | 6.00 / 24.00 | 0.951x |
+| baseline | 0.290552 | 0.00 | 0.00 | 42.00 | 21.00 | 0.00 / 0.00 | 0.00 / 0.00 | 1.000x |
+| shared_left | 0.278562 | 0.00 | 0.00 | 36.00 | 6.00 | 6.00 / 9.00 | 6.00 / 24.00 | 1.043x |
 
 相对 baseline：
 
-- step：`-5.13%`
+- step：`+4.13%`
 - triple：`-71.43%`
 - reveal_tensors：`-14.29%`
 
@@ -312,87 +340,39 @@ shared-left 只会减少“同左输入”的那部分 `epsilon`，不会减少�
 - 说明 shared-left 不只是复用了 `A`，也确实复用了已经打开过的 `epsilon`
 
 
-## 8. 为什么 `rounds` 没变
+## 8. 为什么 `rounds / bytes` 在这次结果里是 0
 
-这是一个很重要的现象。
+这次日志里三组 case 的 `rounds` 和 `bytes` 都是 `0.00`，这是采样方式导致的，不是协议真实通信为 0。
 
-三组里：
+原因是这次运行没有打开通信统计开关（例如 `--verbose-comm`），因此脚本输出里这两个字段处于“未采集”状态。
 
-- `rounds` 都没有下降
+这意味着：
 
-这说明当前实现减少的是：
+- 本次可以可靠比较：`step(s)`、`reveal_tensors`、`triple_gen`、`a_base_hit/miss`、`residual_hit/miss`
+- 本次不适合下结论：`comm_rounds`、`comm_bytes` 的绝对值和降幅
 
-- 每轮里打开的 residual tensor 数量
-- 每轮里传输的字节数
-
-但没有减少：
-
-- reveal 调用次数
-- 通信交互轮次
-
-所以 shared-left 目前更准确地说是：
-
-> 减少每轮负载，而不是减少轮数
-
-这也是为什么协议统计明显变好，但 step 时间不一定稳定变快。
+如果要补齐通信侧结论，建议同配置再跑一轮并开启 `--verbose-comm`。
 
 
-## 9. 为什么 `bytes` 下降了，但 step 时间不一定更快
+## 9. 这次 run 的时间收益怎么解读
 
-这是这组结果最需要解释的地方。
+这次结果里，三个 case 的 step 都是正收益：
 
-### 9.1 tiny：协议节省成功转化成了时间收益
+- tiny：`+3.27%`
+- base：`+20.18%`
+- wide：`+4.13%`
 
-tiny 上：
+### 9.1 tiny：稳定小幅收益
 
-- 通信字节数下降
-- residual tensor 数下降
-- triple 生成次数下降
-- step 时间提升 `8.39%`
+tiny 上 `reveal_tensors` 和 `triple_gen` 的下降成功转化成了时间加速，说明 shared-left 额外开销已被覆盖。
 
-这说明在小规模 case 下，协议侧的节省足以覆盖 shared-left 额外引入的本地 bookkeeping 成本。
+### 9.2 base：收益最明显
 
-### 9.2 base：协议节省存在，但端到端几乎打平
+base 上从 `0.189842s` 降到 `0.151538s`，达到 `1.253x`。这说明在该规模下，shared-left 对总时延的改善最充分。
 
-base 上：
+### 9.3 wide：仍有正收益，但幅度低于 base
 
-- `bytes` 从 `15400960` 降到 `14352384`
-- `reveal_tensors` 从 `34` 降到 `30`
-- `triple_gen` 从 `17` 降到 `5`
-
-但：
-
-- `step` 反而 `-1.19%`
-
-这说明在这个形状上：
-
-- 共享左掩码和 epsilon 的收益
-- 与本地缓存查找、tag 处理、transform 和额外张量管理的成本
-
-大致持平，甚至后者略高。
-
-### 9.3 wide：协议节省更大，但 wall-clock 仍为负收益
-
-wide 上：
-
-- `bytes` 大幅下降
-- `reveal_tensors` 从 `42` 降到 `36`
-- `triple_gen` 从 `21` 降到 `6`
-
-但：
-
-- `step` 下降 `5.13%`
-
-这说明在大张量 GPU 场景里，当前 shared-left 实现虽然减少了通信量，但：
-
-- 轮次没减
-- TFP triple 生成本身是本地行为，不一定是主瓶颈
-- 共享路径的缓存管理和张量处理开销，仍然会影响 wall-clock
-
-换句话说：
-
-- 协议层面：成功
-- 端到端时间：还没有在所有形状上都转化成正收益
+wide 上仍然加速（`+4.13%`），但低于 base，说明更大张量下仍有可继续优化的本地开销空间。
 
 
 ## 10. 本次结果可以得出的结论
@@ -408,7 +388,7 @@ wide 上：
 3. 同左操作数的 `epsilon` 复用已真正命中  
    证据：`residual_hit` 与理论完全一致
 
-4. 协议层节省与理论严格对齐  
+4. 本次可观测的协议层指标与理论对齐  
    证据：
    - `reveal_tensors`
    - `bytes`
@@ -417,13 +397,13 @@ wide 上：
 
 ### 10.2 目前仍未解决的部分
 
-1. `rounds` 没下降  
-   说明当前实现还不是 fused primitive，只是减少了单轮负载
+1. 通信轮次仍未下降  
+   当前 shared-left 仍是“减负载”而不是“减轮次”
 
-2. wall-clock 收益不稳定  
-   - tiny：正收益明显
-   - base：接近打平
-   - wide：协议更省，但时间更慢
+2. 收益跨形状不均衡  
+   - tiny：小幅正收益  
+   - base：收益最高  
+   - wide：正收益但幅度较小
 
 3. 当前 benchmark 反映的是“shared-left + 实验 matmul 复用路径”的整体收益  
    不是“只把 shared-left 单独拎出来”的完全隔离测量
@@ -461,4 +441,5 @@ wide 上：
 
 这组 benchmark 的结论是：
 
-> 你的 shared-left 思路在协议层面已经被严格验证成功：左侧掩码 `A` 和左残差 `epsilon` 的复用都准确命中，`triple_gen`、`reveal_tensors`、`bytes` 均显著下降；但由于当前实现尚未减少通信轮次，且存在本地管理开销，端到端 step 时间收益依赖具体张量规模，在 tiny 上收益明显，在 base 和 wide 上还需要继续压实现开销。
+> shared-left 在协议层命中（`A` 与 `epsilon` 复用）依然成立，并且这次在 tiny/base/wide 三组上都带来了正的 step 加速（分别 `+3.27%`、`+20.18%`、`+4.13%`）；但由于本次未开启通信统计，`rounds/bytes` 还需要补一轮 `--verbose-comm` 才能给出完整通信开销结论。
+

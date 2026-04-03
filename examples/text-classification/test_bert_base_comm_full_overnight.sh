@@ -18,6 +18,10 @@ EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:--1}"
 
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 PER_DEVICE_EVAL_BATCH_SIZE="${PER_DEVICE_EVAL_BATCH_SIZE:-1}"
+EXPERIMENTAL_REUSE_MASK="${EXPERIMENTAL_REUSE_MASK:-1}"
+REUSE_MODE="${REUSE_MODE:-SHARED_LEFT}"
+SHARED_LEFT_MIN_FANOUT="${SHARED_LEFT_MIN_FANOUT:-2}"
+SHARED_LEFT_LOG_GROUPS="${SHARED_LEFT_LOG_GROUPS:-12}"
 
 RUN_TAG="${RUN_TAG:-full_overnight_$(date +%Y%m%d_%H%M%S)}"
 OUT_DIR="eval_private/${TASK_NAME}/${RUN_TAG}"
@@ -26,6 +30,16 @@ mkdir -p "${OUT_DIR}"
 echo "[full-overnight] output_dir=${OUT_DIR}"
 echo "[full-overnight] task=${TASK_NAME} gpu_ids=${GPU_IDS} steps=${MAX_TRAIN_STEPS} len=${LEN_DATA} max_length=${MAX_LENGTH}"
 echo "[full-overnight] train_max_samples=${TRAIN_MAX_SAMPLES} eval_max_samples=${EVAL_MAX_SAMPLES} eval_max_steps=${EVAL_MAX_STEPS}"
+
+EXTRA_ARGS=()
+if [[ "${EXPERIMENTAL_REUSE_MASK}" == "1" ]]; then
+  EXTRA_ARGS+=(
+    --experimental_reuse_mask
+    --reuse_mode "${REUSE_MODE}"
+    --shared_left_min_fanout "${SHARED_LEFT_MIN_FANOUT}"
+    --shared_left_log_groups "${SHARED_LEFT_LOG_GROUPS}"
+  )
+fi
 
 python run_glue_private_light_train.py \
   --model_name_or_path andeskyl/bert-base-cased-${TASK_NAME} \
@@ -42,6 +56,7 @@ python run_glue_private_light_train.py \
   --eval_max_steps ${EVAL_MAX_STEPS} \
   --per_device_train_batch_size ${PER_DEVICE_TRAIN_BATCH_SIZE} \
   --per_device_eval_batch_size ${PER_DEVICE_EVAL_BATCH_SIZE} \
-  --output_dir "${OUT_DIR}"
+  --output_dir "${OUT_DIR}" \
+  "${EXTRA_ARGS[@]}"
 
 echo "[full-overnight] done: ${OUT_DIR}"

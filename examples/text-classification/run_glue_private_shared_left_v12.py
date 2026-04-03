@@ -37,6 +37,11 @@ def _inject_default_argv(argv):
         patched.extend(["--task_name", "sst2"])
     if not _contains_cli_arg(patched, "--lora_target_modules"):
         patched.extend(["--lora_target_modules", "query,key,value"])
+    if not _contains_cli_arg(patched, "--lora_dropout"):
+        # Shared-left on Q / K / V LoRA-A relies on the same hidden-state tensor
+        # feeding the sibling low-rank A projections. Non-zero dropout makes each
+        # branch consume a different randomized left operand during training.
+        patched.extend(["--lora_dropout", "0.0"])
     if not _contains_cli_arg(patched, "--reuse_mode"):
         patched.extend(["--reuse_mode", "SHARED_LEFT"])
     if not _contains_cli_arg(patched, "--shared_left_min_fanout"):
@@ -84,4 +89,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -51,6 +51,7 @@ from crypten.common.reuse_context import clear_current_reuse_step, set_current_r
 from crypten.config import cfg
 from crypten.mpc.primitives import beaver as beaver_protocol
 from multiprocess_launcher import MultiProcessLauncher
+from shared_left_graph_groups import annotate_shared_left_groups_crypten_model
 
 
 # from star_linear_fixed import replace_linear_with_star_fixed
@@ -155,61 +156,7 @@ def _shared_left_operand_transform(module):
 
 
 def _annotate_shared_left_groups_crypten_model(model, min_fanout=2):
-    summary = {
-        "num_graphs": 0,
-        "num_groups": 0,
-        "num_grouped_modules": 0,
-        "groups": [],
-    }
-    if min_fanout < 2:
-        min_fanout = 2
-
-    for graph_name, graph in model.named_modules():
-        if not isinstance(graph, ct.nn.Graph):
-            continue
-        summary["num_graphs"] += 1
-        consumers_by_left_input = defaultdict(list)
-        for node_name, input_names in graph._graph.items():
-            module = graph._modules.get(node_name)
-            if module is None or not _is_shared_left_groupable_module(module):
-                continue
-            if len(input_names) == 0:
-                continue
-            left_input_name = input_names[0]
-            left_input_module = graph._modules.get(left_input_name)
-            if isinstance(left_input_module, ct.nn.Parameter):
-                continue
-            left_transform = _shared_left_operand_transform(module)
-            group_key = (left_input_name, left_transform)
-            consumers_by_left_input[group_key].append((node_name, module))
-
-        for (left_input_name, left_transform), consumers in consumers_by_left_input.items():
-            if len(consumers) < min_fanout:
-                continue
-            graph_prefix = graph_name if graph_name else "root"
-            group_tag = f"shared_left:{graph_prefix}:{left_input_name}:{left_transform}"
-            group_nodes = []
-            for node_name, module in consumers:
-                setattr(module, "beaver_a_group", group_tag)
-                setattr(module, "beaver_layer_tag", f"{graph_prefix}:{node_name}")
-                group_nodes.append(node_name)
-            summary["num_groups"] += 1
-            summary["num_grouped_modules"] += len(consumers)
-            summary["groups"].append(
-                {
-                    "graph": graph_prefix,
-                    "left_input": left_input_name,
-                    "left_transform": left_transform,
-                    "fanout": len(consumers),
-                    "nodes": group_nodes,
-                }
-            )
-
-    summary["groups"] = sorted(
-        summary["groups"],
-        key=lambda item: (item["graph"], item["left_input"]),
-    )
-    return summary
+    return annotate_shared_left_groups_crypten_model(model, min_fanout=min_fanout)
 
 
 def parse_args():

@@ -213,7 +213,23 @@ $$
 - `inject_shared_left_lora_layers(...)`
   - 复用原仓库“递归替换 `nn.Linear`”的思路，不改主训练 loop。
 
-### 6.3 `examples/text-classification/run_glue_private_shared_left_v12.py`
+### 6.3 `examples/text-classification/shared_left_graph_groups.py`
+
+作用：
+
+- 专门负责 CrypTen 图级别的 shared-left 分组。
+- 相比旧版“只看 immediate left input 名字是否完全相同”的逻辑，这一版做了两层增强：
+  1. 显式识别 `query/key/value` 的 `lora_A/MatMul`
+  2. 对左输入做 canonicalization，允许跨 `Identity / Reshape / Flatten / Cast / Dropout` 这类别名节点回溯到同一语义左操作数
+
+内部策略：
+
+- `explicit_qkv_lora_a`
+  - 优先把 Q/K/V 的 `XA_Q / XA_K / XA_V` 分成一组
+- `generic_canonical_left`
+  - 对其它可识别的 shared-left fanout 做兜底分组
+
+### 6.4 `examples/text-classification/run_glue_private_shared_left_v12.py`
 
 作用：
 
@@ -227,10 +243,11 @@ $$
 
 1. monkey patch `LoRALinear` 为 `SharedLeftSplitLoRALinear`
 2. monkey patch `_inject_lora_layers(...)`
-3. 默认把 `--lora_target_modules` 设为 `query,key,value`
-4. 默认打开 `--experimental_reuse_mask`
-5. 默认 `--reuse_mode SHARED_LEFT`
-6. 默认 `--shared_left_min_fanout 3`
+3. 复用新的 `shared_left_graph_groups.py`，让 CrypTen 图分组优先识别 Q/K/V LoRA-A
+4. 默认把 `--lora_target_modules` 设为 `query,key,value`
+5. 默认打开 `--experimental_reuse_mask`
+6. 默认 `--reuse_mode SHARED_LEFT`
+7. 默认 `--shared_left_min_fanout 3`
 
 这里的 `min_fanout=3` 是一个上层偏置：
 
@@ -292,6 +309,11 @@ shared-left 想要命中，至少需要同时满足：
 3. 当前操作是 matmul 路径。
 4. CrypTen 图里有多个 sibling `Gemm / Linear / MatMul` 消费同一个左输入。
 5. 这些模块被 `_annotate_shared_left_groups_crypten_model(...)` 标上同一个 `beaver_a_group`。
+
+在本次修复后，条件 4 的识别方式更具体了：
+
+- 对 LoRA 注意力层，优先匹配 Q/K/V 的 `lora_A/MatMul` 节点家族；
+- 如果 immediate left input 名称不同，但能通过 alias 节点回溯到同一个 canonical left input，仍可归为同一组。
 
 ### 9.2 失效条件
 

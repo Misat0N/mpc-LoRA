@@ -245,9 +245,10 @@ $$
 2. monkey patch `_inject_lora_layers(...)`
 3. 复用新的 `shared_left_graph_groups.py`，让 CrypTen 图分组优先识别 Q/K/V LoRA-A
 4. 默认把 `--lora_target_modules` 设为 `query,key,value`
-5. 默认打开 `--experimental_reuse_mask`
-6. 默认 `--reuse_mode SHARED_LEFT`
-7. 默认 `--shared_left_min_fanout 3`
+5. 默认把 `--lora_dropout` 设为 `0.0`（保证 Q/K/V 的 LoRA-A 在训练态仍共享同一左操作数，便于 shared-left 命中）
+6. 默认打开 `--experimental_reuse_mask`
+7. 默认 `--reuse_mode SHARED_LEFT`
+8. 默认 `--shared_left_min_fanout 3`
 
 这里的 `min_fanout=3` 是一个上层偏置：
 

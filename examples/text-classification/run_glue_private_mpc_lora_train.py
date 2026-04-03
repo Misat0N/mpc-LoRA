@@ -136,6 +136,11 @@ def _get_rank():
         return -1
 
 
+def _comm_barrier():
+    # This repo does not expose `crypten.barrier()`. Use communicator barrier directly.
+    ct.communicator.get().barrier()
+
+
 def _shape_of(tensor):
     try:
         return tuple(tensor.size())
@@ -1467,6 +1472,16 @@ def main():
         args.reuse_log_every_steps,
         args.shared_left_min_fanout,
     )
+    if (
+        rank == 0
+        and args.experimental_reuse_mask
+        and str(args.reuse_mode).upper() == "SHARED_LEFT"
+        and float(args.lora_dropout) > 0.0
+    ):
+        logger.warning(
+            "[shared-left] lora_dropout=%s > 0 may break Q/K/V same-left grouping for LoRA-A in training mode",
+            args.lora_dropout,
+        )
     # print("done")
     # exit()
     dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
@@ -1889,7 +1904,7 @@ def main():
     # Phase barrier: private eval / decrypt also use collectives. Without an
     # explicit sync here, one rank can leave training and enter the next phase
     # while another rank is still in the previous collective-heavy section.
-    ct.barrier()
+    _comm_barrier()
 
     private_eval_metric = {"skipped": True, "reason": "disabled"}
     if not args.skip_private_eval:
@@ -1933,7 +1948,7 @@ def main():
         logger.info("[eval-private] skipped by flag --skip_private_eval")
 
     # Keep all ranks aligned before entering decrypt / plaintext recovery.
-    ct.barrier()
+    _comm_barrier()
 
     # Step 3B: recover a plaintext model and run plaintext evaluation.
     plain_eval_metric = {"skipped": True, "reason": "disabled"}
@@ -1946,7 +1961,7 @@ def main():
         private_model.decrypt()
         # Keep decrypted CrypTen parameters on CPU so to_pytorch() can assign storage safely.
         private_model = private_model.to("cpu")
-    ct.barrier()
+    _comm_barrier()
     if rank == 0 and ((not args.skip_plain_eval) or (args.output_dir is not None)):
         try:
             trained_model = _recover_plain_model_from_private(private_model, model, rank)

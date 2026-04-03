@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import threading
+import weakref
 
 import torch
 from crypten.config import cfg
@@ -70,23 +71,41 @@ class _SharedMaskRegistry:
     __slots__ = ("_plain", "_cache_key")
 
     def __init__(self):
-        self._plain = {}
-        self._cache_key = {}
+        # Key by object identity via weak refs to avoid stale id() collisions.
+        self._plain = weakref.WeakKeyDictionary()
+        self._cache_key = weakref.WeakKeyDictionary()
 
     def clear(self):
         self._plain.clear()
         self._cache_key.clear()
 
     def register(self, shared, plain, cache_key=None):
-        shared_id = id(shared)
-        self._plain[shared_id] = plain
-        self._cache_key[shared_id] = cache_key
+        try:
+            self._plain[shared] = plain
+            self._cache_key[shared] = cache_key
+            return
+        except TypeError:
+            # Fallback for non-weakref-able objects.
+            setattr(shared, "_beaver_plain_mask", plain)
+            setattr(shared, "_beaver_cache_key", cache_key)
 
     def get_plain(self, shared):
-        return self._plain.get(id(shared))
+        try:
+            value = self._plain.get(shared)
+        except TypeError:
+            value = None
+        if value is not None:
+            return value
+        return getattr(shared, "_beaver_plain_mask", None)
 
     def get_cache_key(self, shared):
-        return self._cache_key.get(id(shared))
+        try:
+            value = self._cache_key.get(shared)
+        except TypeError:
+            value = None
+        if value is not None:
+            return value
+        return getattr(shared, "_beaver_cache_key", None)
 
 
 class BeaverReuseCache:

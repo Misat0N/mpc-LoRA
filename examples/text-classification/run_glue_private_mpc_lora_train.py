@@ -549,6 +549,67 @@ def _count_trainable_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def _parse_keyword_list(raw_keywords):
+    if raw_keywords is None:
+        return []
+    if isinstance(raw_keywords, str):
+        raw_keywords = raw_keywords.split(",")
+    return [str(item).strip() for item in raw_keywords if str(item).strip()]
+
+
+def _matches_any_keyword(name, keywords):
+    name_lower = str(name).lower()
+    return any(keyword.lower() in name_lower for keyword in keywords)
+
+
+def _publicize_non_lora_parameters(private_model, keep_encrypted_keywords, device):
+    """
+    Convert encrypted parameters to plaintext tensors unless they match
+    keep_encrypted_keywords. This enables secret-activation x public-weight paths.
+    """
+    keywords = _parse_keyword_list(keep_encrypted_keywords)
+    if not keywords:
+        raise ValueError(
+            "publicize_non_lora_parameters requires non-empty keep_encrypted_keywords."
+        )
+
+    converted = 0
+    kept_encrypted = 0
+    already_public = 0
+    kept_examples = []
+
+    for module_prefix, module in private_model.named_modules():
+        direct_params = list(module.named_parameters(recurse=False))
+        for local_name, param in direct_params:
+            full_name = f"{module_prefix}.{local_name}" if module_prefix else local_name
+            keep_encrypted = _matches_any_keyword(full_name, keywords)
+            if keep_encrypted:
+                kept_encrypted += 1
+                if len(kept_examples) < 12:
+                    kept_examples.append(full_name)
+                continue
+
+            if ct.is_encrypted_tensor(param):
+                plain = param.get_plain_text().detach()
+                if device is not None:
+                    plain = plain.to(device)
+                plain.requires_grad = False
+                module.set_parameter(local_name, plain)
+                converted += 1
+            else:
+                if hasattr(param, "requires_grad"):
+                    param.requires_grad = False
+                already_public += 1
+
+    return {
+        "converted_to_public": converted,
+        "kept_encrypted": kept_encrypted,
+        "already_public": already_public,
+        "keep_encrypted_keywords": keywords,
+        "kept_examples": kept_examples,
+    }
+
+
 class LoRALinear(nn.Module):
     def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
@@ -985,6 +1046,23 @@ def parse_args():
         help="If passed, freeze classifier/score head and train only LoRA params.",
     )
     parser.add_argument(
+        "--public_non_lora_weights",
+        action="store_true",
+        help=(
+            "If passed, convert encrypted non-LoRA parameters to public tensors "
+            "after CrypTen model conversion so only LoRA weights stay encrypted."
+        ),
+    )
+    parser.add_argument(
+        "--encrypted_param_keywords",
+        type=str,
+        default="lora_A.,lora_B.",
+        help=(
+            "Comma-separated parameter-name keywords that must remain encrypted "
+            "when --public_non_lora_weights is enabled."
+        ),
+    )
+    parser.add_argument(
         "--learning_rate",
         type=float,
         default=5e-4,
@@ -1163,6 +1241,17 @@ def main():
 
     if args.loss_type == "auto":
         args.loss_type = "mse" if args.quick_run else "ce"
+
+    if args.public_non_lora_weights and args.train_classifier_only:
+        raise ValueError(
+            "--public_non_lora_weights conflicts with --train_classifier_only. "
+            "Public-only mode keeps non-LoRA weights frozen."
+        )
+    if args.public_non_lora_weights and not args.freeze_classifier_head:
+        args.freeze_classifier_head = True
+        logger.warning(
+            "[public-non-lora] forcing --freeze_classifier_head because non-LoRA weights are public/frozen."
+        )
 
     need_eval = (not args.skip_private_eval) or (not args.skip_plain_eval)
     _require_evaluate(need_eval)
@@ -1530,6 +1619,16 @@ def main():
                         left_inputs,
                         canonical_left_inputs,
                     )
+    publicized_param_summary = None
+    if args.public_non_lora_weights:
+        publicized_param_summary = _publicize_non_lora_parameters(
+            private_model,
+            keep_encrypted_keywords=args.encrypted_param_keywords,
+            device=device,
+        )
+        if rank == 0:
+            logger.info("[public-non-lora] summary=%s", publicized_param_summary)
+
     private_model.train()
     lr = args.learning_rate
     optimizer = ct.optim.SGD(
@@ -2043,6 +2142,7 @@ def main():
         else:
             logger.warning("[save] skip trained model export: plaintext model unavailable")
 
+        total_elapsed_s = time.time() - script_start_time
         summary = {
             "train_steps": global_step,
             "private_eval_metric": private_eval_metric,
@@ -2055,6 +2155,11 @@ def main():
             "shared_left_group_summary": shared_left_group_summary,
             "reuse_profile_summary": reuse_profile_summary,
             "numeric_probe_summary": numeric_probe_summary,
+            "public_non_lora_weights": args.public_non_lora_weights,
+            "encrypted_param_keywords": args.encrypted_param_keywords,
+            "publicized_param_summary": publicized_param_summary,
+            "final_comm_stats": ct.get_communication_stats(),
+            "total_elapsed_s": total_elapsed_s,
         }
         summary_path = os.path.join(args.output_dir, "train_eval_summary.json")
         with open(summary_path, "w") as f:

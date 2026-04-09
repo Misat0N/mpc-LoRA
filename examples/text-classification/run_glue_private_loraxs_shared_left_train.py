@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Thin wrapper around the existing MPC LoRA training entrypoint.
-
-Goals:
-- reuse the current repository's CrypTen training loop as-is
-- keep modifications minimal by monkey-patching the LoRA layer wrapper
-- default the experiment toward shared-left-v1.2 behavior on attention Q/K/V
+LoRA-XS + shared-left private finetuning entrypoint.
 """
 
 import sys
@@ -18,7 +13,7 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 import run_glue_private_mpc_lora_train as base
-from shared_left_v12_lora import SharedLeftSplitLoRALinear, inject_shared_left_lora_layers
+from loraxs_public_layers import LoRAXSPublicLinear, inject_loraxs_layers
 
 
 _ORIGINAL_PARSE_ARGS = base.parse_args
@@ -38,20 +33,14 @@ def _inject_default_argv(argv):
     if not _contains_cli_arg(patched, "--lora_target_modules"):
         patched.extend(["--lora_target_modules", "query,key,value"])
     if not _contains_cli_arg(patched, "--lora_dropout"):
-        # Shared-left on Q / K / V LoRA-A relies on the same hidden-state tensor
-        # feeding the sibling low-rank A projections. Non-zero dropout makes each
-        # branch consume a different randomized left operand during training.
         patched.extend(["--lora_dropout", "0.0"])
-    if not _contains_cli_arg(patched, "--freeze_classifier_head"):
-        patched.append("--freeze_classifier_head")
     if not _contains_cli_arg(patched, "--public_non_lora_weights"):
         patched.append("--public_non_lora_weights")
     if not _contains_cli_arg(patched, "--encrypted_param_keywords"):
-        patched.extend(["--encrypted_param_keywords", "lora_A.,lora_B."])
+        patched.extend(["--encrypted_param_keywords", "lora_latent.,classifier.,score."])
     if not _contains_cli_arg(patched, "--reuse_mode"):
         patched.extend(["--reuse_mode", "SHARED_LEFT"])
     if not _contains_cli_arg(patched, "--shared_left_min_fanout"):
-        # Fanout=3 lines up with the Q / K / V sibling structure.
         patched.extend(["--shared_left_min_fanout", "3"])
     if not _contains_cli_arg(patched, "--shared_left_log_groups"):
         patched.extend(["--shared_left_log_groups", "12"])
@@ -70,8 +59,22 @@ def _patched_parse_args():
         sys.argv = original_argv
 
 
-base.LoRALinear = SharedLeftSplitLoRALinear
-base._inject_lora_layers = inject_shared_left_lora_layers
+def _set_loraxs_trainable(model, train_classifier_head=True):
+    del train_classifier_head
+
+    trainable = []
+    for name, param in model.named_parameters():
+        is_loraxs = "lora_latent." in name
+        is_classifier = name.startswith("classifier.") or name.startswith("score.")
+        param.requires_grad = is_loraxs or is_classifier
+        if param.requires_grad:
+            trainable.append(name)
+    return trainable
+
+
+base.LoRALinear = LoRAXSPublicLinear
+base._inject_lora_layers = inject_loraxs_layers
+base._set_lora_trainable = _set_loraxs_trainable
 base.parse_args = _patched_parse_args
 
 
@@ -84,9 +87,7 @@ def main():
         with base.cfg.temp_override({"cost.estimate_cost": False}):
             base.main()
     else:
-        with base.cfg.temp_override(
-            {"cost.estimate_cost": args.print_comm_cost, "cost.estimate_mode": "comm"}
-        ):
+        with base.cfg.temp_override({"cost.estimate_cost": args.print_comm_cost, "cost.estimate_mode": "comm"}):
             launcher = base.MultiProcessLauncher(2, base.main)
             launcher.start()
             launcher.join()

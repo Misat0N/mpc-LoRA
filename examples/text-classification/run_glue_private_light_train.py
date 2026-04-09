@@ -1035,6 +1035,7 @@ def main():
             trained_model.save_pretrained(trained_model_dir)
             tokenizer.save_pretrained(trained_model_dir)
 
+        total_elapsed_s = time.time() - script_start_time
         summary = {
             "train_steps": global_step,
             "private_eval_metric": private_eval_metric,
@@ -1045,6 +1046,8 @@ def main():
             "experimental_reuse_mask": args.experimental_reuse_mask,
             "reuse_mode": args.reuse_mode,
             "shared_left_group_summary": shared_left_group_summary,
+            "final_comm_stats": ct.get_communication_stats(),
+            "total_elapsed_s": total_elapsed_s,
         }
         summary_path = os.path.join(args.output_dir, "train_eval_summary.json")
         with open(summary_path, "w") as f:

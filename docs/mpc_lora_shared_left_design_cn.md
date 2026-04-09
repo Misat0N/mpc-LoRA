@@ -158,11 +158,16 @@ $$
 3. 只训练 LoRA 参数和可选的分类头。
 4. 完成 PyTorch 构图后，再整体执行 `ct.nn.from_pytorch(...).encrypt()`。
 
-因此，当前 runtime 仍然是“模型整体进入密态”的实现。也就是说：
+因此，当前实现演进为“两阶段”：
 
-- 代码结构上已经可以区分“冻结 backbone”与“LoRA 分支”。
-- 但 runtime 层面尚未真正实现 `secret activation x public frozen weight` 的单独快路径。
-- 这一点在本文档里必须如实记录，不能把“结构上分开”误写成“运行时已经 public-weight 优化完毕”。
+1. 先按历史路径执行 `ct.nn.from_pytorch(...).encrypt()`；
+2. 再把非 LoRA 参数（默认含 backbone 与分类头）从密态参数回退为公开张量，仅保留 LoRA 参数密态。
+
+这意味着：
+
+- 代码结构上仍显式区分“冻结 backbone”与“LoRA 分支”；
+- runtime 层面已经支持本项目需要的“数据密态 + LoRA 密态 + 非 LoRA 权重公开”执行方式；
+- `secret activation x public frozen weight` 会走公开权重路径（不再走最昂贵的 secret-secret Beaver matmul）。
 
 ## 6. 本次新增/整理的文件
 
@@ -246,9 +251,12 @@ $$
 3. 复用新的 `shared_left_graph_groups.py`，让 CrypTen 图分组优先识别 Q/K/V LoRA-A
 4. 默认把 `--lora_target_modules` 设为 `query,key,value`
 5. 默认把 `--lora_dropout` 设为 `0.0`（保证 Q/K/V 的 LoRA-A 在训练态仍共享同一左操作数，便于 shared-left 命中）
-6. 默认打开 `--experimental_reuse_mask`
-7. 默认 `--reuse_mode SHARED_LEFT`
-8. 默认 `--shared_left_min_fanout 3`
+6. 默认 `--freeze_classifier_head`（仅训练 LoRA）
+7. 默认 `--public_non_lora_weights`（非 LoRA 权重公开）
+8. 默认 `--encrypted_param_keywords lora_A.,lora_B.`（仅 LoRA 参数保持密态）
+9. 默认打开 `--experimental_reuse_mask`
+10. 默认 `--reuse_mode SHARED_LEFT`
+11. 默认 `--shared_left_min_fanout 3`
 
 这里的 `min_fanout=3` 是一个上层偏置：
 
@@ -455,13 +463,8 @@ python examples/text-classification/run_glue_private_shared_left_v12.py \
 
 1. 当前 shared-left 主要打在 CrypTen 图中被自动识别到的 `Gemm / Linear / MatMul` 上，不是所有算子。
 2. 现阶段更像“结构正确 + smoke 可跑”的研究原型，而不是全面优化完成的训练系统。
-3. 当前 runtime 仍然整体 `.encrypt()` 模型，因此还没有真正实现：
-
-$$
-\text{secret activation} \times \text{public frozen weight}
-$$
-
-的独立快路径。
+3. 当前实现采用“先 `.encrypt()` 再按参数名公开化非 LoRA 权重”的工程方案；
+   它已经满足本项目的核心目标（仅 LoRA + 数据保密），但还不是独立 runtime 后端级别的完整重构。
 
 4. 本次实现通过显式 `xW + (xA)B` 拆分和 Q/K/V 默认 targeting，把优化焦点先集中在 LoRA 小分支上；但 shared-left 的最终命中仍由 CrypTen 图结构决定。
 

@@ -490,8 +490,17 @@ class Module:
                         ),
                     )
                 else:  # decrypt parameter
-                    self.set_parameter(name, param.get_plain_text())
-                    self._parameters[name].requires_grad = requires_grad
+                    if isinstance(param, crypten.CrypTensor) or hasattr(param, "get_plain_text"):
+                        self.set_parameter(name, param.get_plain_text())
+                        self._parameters[name].requires_grad = requires_grad
+                    elif torch.is_tensor(param):
+                        # Mixed public/private models may already contain
+                        # plaintext parameters after selective publicization.
+                        self._parameters[name].requires_grad = requires_grad
+                    else:
+                        raise TypeError(
+                            f"Cannot decrypt parameter `{name}` of type {type(param).__name__}"
+                        )
 
             # encrypt / decrypt buffers:
             for name, buffer in self.named_buffers(recurse=False):

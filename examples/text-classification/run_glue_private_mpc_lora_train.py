@@ -610,6 +610,75 @@ def _publicize_non_lora_parameters(private_model, keep_encrypted_keywords, devic
     }
 
 
+def _count_param_numel(params):
+    total = 0
+    for param in params:
+        if hasattr(param, "numel"):
+            total += int(param.numel())
+    return total
+
+
+def _build_private_optimizer(private_model, args):
+    grad_threshold = args.grad_threshold if args.grad_threshold > 0 else None
+    classifier_lr = getattr(args, "classifier_learning_rate", None)
+
+    if classifier_lr is None or classifier_lr <= 0:
+        trainable_params = [
+            param for param in private_model.parameters() if getattr(param, "requires_grad", False)
+        ]
+        optimizer = ct.optim.SGD(
+            trainable_params,
+            lr=args.learning_rate,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            nesterov=args.nesterov,
+            grad_threshold=grad_threshold,
+        )
+        return optimizer, {
+            "optimizer_type": "sgd_single_lr",
+            "learning_rate": args.learning_rate,
+            "classifier_learning_rate": None,
+            "num_trainable_tensors": len(trainable_params),
+            "num_trainable_parameters": _count_param_numel(trainable_params),
+        }
+
+    classifier_params = []
+    non_classifier_params = []
+    for name, param in private_model.named_parameters():
+        if not getattr(param, "requires_grad", False):
+            continue
+        if name.startswith("classifier.") or name.startswith("score."):
+            classifier_params.append(param)
+        else:
+            non_classifier_params.append(param)
+
+    param_groups = []
+    if non_classifier_params:
+        param_groups.append({"params": non_classifier_params, "lr": args.learning_rate})
+    if classifier_params:
+        param_groups.append({"params": classifier_params, "lr": classifier_lr})
+    if not param_groups:
+        raise RuntimeError("No trainable parameters found for optimizer initialization.")
+
+    optimizer = ct.optim.SGD(
+        param_groups,
+        lr=args.learning_rate,
+        momentum=args.momentum,
+        weight_decay=args.weight_decay,
+        nesterov=args.nesterov,
+        grad_threshold=grad_threshold,
+    )
+    return optimizer, {
+        "optimizer_type": "sgd_grouped_lr",
+        "learning_rate": args.learning_rate,
+        "classifier_learning_rate": classifier_lr,
+        "num_non_classifier_tensors": len(non_classifier_params),
+        "num_non_classifier_parameters": _count_param_numel(non_classifier_params),
+        "num_classifier_tensors": len(classifier_params),
+        "num_classifier_parameters": _count_param_numel(classifier_params),
+    }
+
+
 class LoRALinear(nn.Module):
     def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
@@ -1067,6 +1136,15 @@ def parse_args():
         type=float,
         default=5e-4,
         help="Learning rate for MPC optimizer.",
+    )
+    parser.add_argument(
+        "--classifier_learning_rate",
+        type=float,
+        default=None,
+        help=(
+            "Optional learning-rate override for classifier / score parameters. "
+            "If unset, --learning_rate is used for every trainable parameter."
+        ),
     )
     parser.add_argument(
         "--momentum",
@@ -1630,23 +1708,11 @@ def main():
             logger.info("[public-non-lora] summary=%s", publicized_param_summary)
 
     private_model.train()
-    lr = args.learning_rate
-    optimizer = ct.optim.SGD(
-        private_model.parameters(),
-        lr=lr,
-        momentum=args.momentum,
-        weight_decay=args.weight_decay,
-        nesterov=args.nesterov,
-        grad_threshold=(args.grad_threshold if args.grad_threshold > 0 else None),
-    )
+    optimizer, optimizer_summary = _build_private_optimizer(private_model, args)
     logger.info(
-        "[rank %s] model set to train mode; optimizer initialized (lr=%s momentum=%s weight_decay=%s nesterov=%s grad_threshold=%s)",
+        "[rank %s] model set to train mode; optimizer initialized %s",
         rank,
-        lr,
-        args.momentum,
-        args.weight_decay,
-        args.nesterov,
-        (args.grad_threshold if args.grad_threshold > 0 else None),
+        optimizer_summary,
     )
     # 模型不加密
     # private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).to(device)
@@ -2157,6 +2223,9 @@ def main():
             "numeric_probe_summary": numeric_probe_summary,
             "public_non_lora_weights": args.public_non_lora_weights,
             "encrypted_param_keywords": args.encrypted_param_keywords,
+            "learning_rate": args.learning_rate,
+            "classifier_learning_rate": args.classifier_learning_rate,
+            "optimizer_summary": optimizer_summary,
             "publicized_param_summary": publicized_param_summary,
             "final_comm_stats": ct.get_communication_stats(),
             "total_elapsed_s": total_elapsed_s,

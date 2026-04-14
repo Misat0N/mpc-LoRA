@@ -1479,6 +1479,12 @@ def main():
         logger.warning(
             "[train-params] --train_classifier_only is enabled. This overrides LoRA trainability selection."
         )
+    trainable_params = [param for param in model.parameters() if getattr(param, "requires_grad", False)]
+    trainable_param_summary = {
+        "num_trainable_tensors": len(trainable_params),
+        "num_trainable_parameters": _count_param_numel(trainable_params),
+        "trainable_preview": trainable_names[:24],
+    }
 
     logger.info(
         "[lora] injected=%s first_modules=%s",
@@ -2226,6 +2232,7 @@ def main():
             "learning_rate": args.learning_rate,
             "classifier_learning_rate": args.classifier_learning_rate,
             "optimizer_summary": optimizer_summary,
+            "trainable_param_summary": trainable_param_summary,
             "publicized_param_summary": publicized_param_summary,
             "final_comm_stats": ct.get_communication_stats(),
             "total_elapsed_s": total_elapsed_s,

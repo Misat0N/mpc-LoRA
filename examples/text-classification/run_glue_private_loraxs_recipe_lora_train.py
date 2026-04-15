@@ -43,6 +43,8 @@ def _inject_default_argv(argv):
         )
     if not _contains_cli_arg(patched, "--lora_dropout"):
         patched.extend(["--lora_dropout", "0.0"])
+    if not _contains_cli_arg(patched, "--crypten_native_lora"):
+        patched.append("--crypten_native_lora")
     if not _contains_cli_arg(patched, "--public_non_lora_weights"):
         patched.append("--public_non_lora_weights")
     if not _contains_cli_arg(patched, "--encrypted_param_keywords"):

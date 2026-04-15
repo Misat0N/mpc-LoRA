@@ -19,6 +19,7 @@
 import argparse
 import builtins
 from collections import defaultdict, deque
+import copy
 import json
 import logging
 import math
@@ -800,6 +801,43 @@ class LoRALinear(nn.Module):
         return result
 
 
+class CrypTenLoRALinear(ct.nn.Module):
+    def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
+        super().__init__()
+        if not isinstance(base_layer, ct.nn.Linear):
+            raise TypeError(
+                f"CrypTenLoRALinear expects crypten.nn.Linear, got {type(base_layer).__name__}"
+            )
+
+        self.base = base_layer
+        self.r = int(r)
+        self.alpha = int(alpha)
+        self.scaling = float(alpha) / float(r) if r > 0 else 0.0
+        self.lora_dropout_p = float(dropout)
+
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+        if self.r > 0:
+            in_features = int(self.base.weight.size(1))
+            out_features = int(self.base.weight.size(0))
+            self.lora_A = ct.nn.Linear(in_features, self.r, bias=False)
+            self.lora_B = ct.nn.Linear(self.r, out_features, bias=False)
+            torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            torch.nn.init.zeros_(self.lora_B.weight)
+        else:
+            self.lora_A = None
+            self.lora_B = None
+
+    def forward(self, x):
+        result = self.base(x)
+        if self.r > 0:
+            x_lora = x.dropout(p=self.lora_dropout_p, training=self.training) if self.lora_dropout_p > 0 else x
+            lora_out = self.lora_B(self.lora_A(x_lora)).mul(self.scaling)
+            result = result.add(lora_out)
+        return result
+
+
 def _inject_lora_layers(module, target_keywords, r, alpha, dropout, prefix=""):
     replaced = []
     for child_name, child in list(module.named_children()):
@@ -810,6 +848,36 @@ def _inject_lora_layers(module, target_keywords, r, alpha, dropout, prefix=""):
         else:
             replaced.extend(
                 _inject_lora_layers(
+                    child,
+                    target_keywords=target_keywords,
+                    r=r,
+                    alpha=alpha,
+                    dropout=dropout,
+                    prefix=full_name,
+                )
+            )
+    return replaced
+
+
+def _replace_child_module(parent_module, child_name, new_module):
+    parent_module._modules[child_name] = new_module
+    setattr(parent_module, child_name, new_module)
+
+
+def _inject_crypten_lora_layers(module, target_keywords, r, alpha, dropout, prefix=""):
+    replaced = []
+    for child_name, child in list(module.named_children()):
+        full_name = f"{prefix}.{child_name}" if prefix else child_name
+        if isinstance(child, ct.nn.Linear) and any(k in full_name for k in target_keywords):
+            _replace_child_module(
+                module,
+                child_name,
+                CrypTenLoRALinear(child, r=r, alpha=alpha, dropout=dropout),
+            )
+            replaced.append(full_name)
+        else:
+            replaced.extend(
+                _inject_crypten_lora_layers(
                     child,
                     target_keywords=target_keywords,
                     r=r,
@@ -1207,6 +1275,14 @@ def parse_args():
         help="If passed, freeze classifier/score head and train only LoRA params.",
     )
     parser.add_argument(
+        "--crypten_native_lora",
+        action="store_true",
+        help=(
+            "Inject standard LoRA directly into the CrypTen model after "
+            "PyTorch-to-CrypTen conversion instead of before ONNX export."
+        ),
+    )
+    parser.add_argument(
         "--public_non_lora_weights",
         action="store_true",
         help=(
@@ -1571,26 +1647,49 @@ def main():
         trust_remote_code=args.trust_remote_code,
     )
     lora_targets = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
-    replaced_lora_modules = _inject_lora_layers(
-        model,
-        target_keywords=lora_targets,
-        r=args.lora_r,
-        alpha=args.lora_alpha,
-        dropout=args.lora_dropout,
-    )
+    recovery_template_model = model
+    trainable_reference_model = model
+
+    if args.crypten_native_lora:
+        recovery_template_model = copy.deepcopy(model)
+        trainable_reference_model = recovery_template_model
+        replaced_lora_modules = _inject_lora_layers(
+            recovery_template_model,
+            target_keywords=lora_targets,
+            r=args.lora_r,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
+        logger.info(
+            "[crypten-native-lora] enabled: exporting backbone first, injecting LoRA after CrypTen conversion"
+        )
+    else:
+        replaced_lora_modules = _inject_lora_layers(
+            model,
+            target_keywords=lora_targets,
+            r=args.lora_r,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
+
     if len(replaced_lora_modules) == 0:
         raise ValueError(
             f"No Linear layers matched --lora_target_modules='{args.lora_target_modules}'. "
             "Please adjust target keywords."
         )
 
-    trainable_names = _set_lora_trainable(model, train_classifier_head=(not args.freeze_classifier_head))
+    trainable_names = _set_lora_trainable(
+        trainable_reference_model,
+        train_classifier_head=(not args.freeze_classifier_head),
+    )
     if args.train_classifier_only:
-        trainable_names = _set_classifier_only_trainable(model)
+        trainable_names = _set_classifier_only_trainable(trainable_reference_model)
         logger.warning(
             "[train-params] --train_classifier_only is enabled. This overrides LoRA trainability selection."
         )
-    trainable_params = [param for param in model.parameters() if getattr(param, "requires_grad", False)]
+    trainable_params = [
+        param for param in trainable_reference_model.parameters() if getattr(param, "requires_grad", False)
+    ]
     trainable_param_summary = {
         "num_trainable_tensors": len(trainable_params),
         "num_trainable_parameters": _count_param_numel(trainable_params),
@@ -1604,7 +1703,7 @@ def main():
     )
     logger.info(
         "[train-params] total_trainable_params=%s trainable_name_count=%s",
-        _count_trainable_params(model),
+        _count_trainable_params(trainable_reference_model),
         len(trainable_names),
     )
 
@@ -1769,7 +1868,26 @@ def main():
     # print("done")
     # exit()
     dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
-    private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).encrypt().to(device)
+    private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy))
+    if args.crypten_native_lora:
+        replaced_private_lora_modules = _inject_crypten_lora_layers(
+            private_model,
+            target_keywords=lora_targets,
+            r=args.lora_r,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
+        if len(replaced_private_lora_modules) == 0:
+            raise RuntimeError(
+                "CrypTen-native LoRA injection matched 0 modules after PyTorch conversion."
+            )
+        if rank == 0:
+            logger.info(
+                "[crypten-native-lora] injected=%s first_modules=%s",
+                len(replaced_private_lora_modules),
+                replaced_private_lora_modules[:12],
+            )
+    private_model = private_model.encrypt().to(device)
     shared_left_group_summary = None
     if args.experimental_reuse_mask and str(args.reuse_mode).upper() == "SHARED_LEFT":
         shared_left_group_summary = _annotate_shared_left_groups_crypten_model(
@@ -2266,7 +2384,11 @@ def main():
     _comm_barrier()
     if rank == 0 and ((not args.skip_plain_eval) or (args.output_dir is not None)):
         try:
-            trained_model = _recover_plain_model_from_private(private_model, model, rank)
+            trained_model = _recover_plain_model_from_private(
+                private_model,
+                recovery_template_model,
+                rank,
+            )
             if not args.skip_plain_eval:
                 trained_model = trained_model.to(device)
             trained_model.eval()
@@ -2341,6 +2463,7 @@ def main():
             "task_name": args.task_name,
             "max_train_steps": args.max_train_steps,
             "eval_max_steps": args.eval_max_steps,
+            "crypten_native_lora": args.crypten_native_lora,
             "experimental_reuse_mask": args.experimental_reuse_mask,
             "reuse_mode": args.reuse_mode,
             "shared_left_group_summary": shared_left_group_summary,

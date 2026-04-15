@@ -804,9 +804,10 @@ class LoRALinear(nn.Module):
 class CrypTenLoRALinear(ct.nn.Module):
     def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
-        if not isinstance(base_layer, ct.nn.Linear):
+        if not isinstance(base_layer, (ct.nn.Linear, ct.nn.MatMul)):
             raise TypeError(
-                f"CrypTenLoRALinear expects crypten.nn.Linear, got {type(base_layer).__name__}"
+                "CrypTenLoRALinear expects crypten.nn.Linear or crypten.nn.MatMul, "
+                f"got {type(base_layer).__name__}"
             )
 
         self.base = base_layer
@@ -819,8 +820,12 @@ class CrypTenLoRALinear(ct.nn.Module):
             p.requires_grad = False
 
         if self.r > 0:
-            in_features = int(self.base.weight.size(1))
-            out_features = int(self.base.weight.size(0))
+            if isinstance(self.base, ct.nn.Linear):
+                in_features = int(self.base.weight.size(1))
+                out_features = int(self.base.weight.size(0))
+            else:
+                in_features = int(self.base.weight.size(0))
+                out_features = int(self.base.weight.size(1))
             self.lora_A = ct.nn.Linear(in_features, self.r, bias=False)
             self.lora_B = ct.nn.Linear(self.r, out_features, bias=False)
             torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
@@ -868,7 +873,7 @@ def _inject_crypten_lora_layers(module, target_keywords, r, alpha, dropout, pref
     replaced = []
     for child_name, child in list(module.named_children()):
         full_name = f"{prefix}.{child_name}" if prefix else child_name
-        if isinstance(child, ct.nn.Linear) and any(k in full_name for k in target_keywords):
+        if isinstance(child, (ct.nn.Linear, ct.nn.MatMul)) and any(k in full_name for k in target_keywords):
             _replace_child_module(
                 module,
                 child_name,

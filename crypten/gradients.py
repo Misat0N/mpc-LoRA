@@ -809,12 +809,14 @@ class AutogradMatMul(AutogradFunction):
         grad_input_tag = AutogradMatMul._build_beaver_tag(
             base_tag, "backward_dX", grad_output, grad_input_right
         )
-        grad_weight_tag_kwargs = {}
-        if reuse_mode != "SHARED_LEFT":
-            grad_weight_tag_kwargs.update(
-                a_anchor=forward_anchor_a,
-                epsilon_anchor=forward_anchor_eps,
-            )
+        # Enable forward -> backward_dW transpose reuse for every reuse mode.
+        # For SHARED_LEFT this adds the missing bridge from forward (X - A)
+        # to backward_dW (X^T - A^T), while sibling grouping inside backward_dW
+        # still remains available through the shared a_group carried in base_tag.
+        grad_weight_tag_kwargs = {
+            "a_anchor": forward_anchor_a,
+            "epsilon_anchor": forward_anchor_eps,
+        }
         grad_weight_tag = AutogradMatMul._build_beaver_tag(
             base_tag,
             "backward_dW",

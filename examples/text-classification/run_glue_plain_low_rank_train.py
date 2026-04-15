@@ -30,6 +30,7 @@ from transformers import (
     DataCollatorWithPadding,
     PretrainedConfig,
     default_data_collator,
+    get_linear_schedule_with_warmup,
     set_seed,
 )
 
@@ -65,8 +66,12 @@ def parse_args():
     parser.add_argument("--lora_target_modules", type=str, default="query,key,value")
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--classifier_learning_rate", type=float, default=None)
+    parser.add_argument("--optimizer_type", type=str, default="sgd", choices=["sgd", "adamw"])
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--lr_scheduler_type", type=str, default="none", choices=["none", "linear"])
+    parser.add_argument("--num_warmup_steps", type=int, default=0)
+    parser.add_argument("--warmup_ratio", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu_ids", type=str, default="0")
     parser.add_argument("--output_dir", type=str, default=None)
@@ -97,16 +102,16 @@ def _set_loraxs_trainable(model):
 
 def _build_optimizer(model, args):
     classifier_lr = args.classifier_learning_rate
+    optimizer_class = torch.optim.AdamW if args.optimizer_type == "adamw" else torch.optim.SGD
+    optimizer_kwargs = {"lr": args.learning_rate, "weight_decay": args.weight_decay}
+    if args.optimizer_type == "sgd":
+        optimizer_kwargs["momentum"] = args.momentum
+
     if classifier_lr is None or classifier_lr <= 0:
         trainable_params = [param for param in model.parameters() if getattr(param, "requires_grad", False)]
-        optimizer = torch.optim.SGD(
-            trainable_params,
-            lr=args.learning_rate,
-            momentum=args.momentum,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = optimizer_class(trainable_params, **optimizer_kwargs)
         return optimizer, {
-            "optimizer_type": "torch_sgd_single_lr",
+            "optimizer_type": f"torch_{args.optimizer_type}_single_lr",
             "learning_rate": args.learning_rate,
             "classifier_learning_rate": None,
             "num_trainable_tensors": len(trainable_params),
@@ -129,20 +134,47 @@ def _build_optimizer(model, args):
     if classifier_params:
         param_groups.append({"params": classifier_params, "lr": classifier_lr})
 
-    optimizer = torch.optim.SGD(
-        param_groups,
-        lr=args.learning_rate,
-        momentum=args.momentum,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = optimizer_class(param_groups, **optimizer_kwargs)
     return optimizer, {
-        "optimizer_type": "torch_sgd_grouped_lr",
+        "optimizer_type": f"torch_{args.optimizer_type}_grouped_lr",
         "learning_rate": args.learning_rate,
         "classifier_learning_rate": classifier_lr,
         "num_non_classifier_tensors": len(non_classifier_params),
         "num_non_classifier_parameters": _count_param_numel(non_classifier_params),
         "num_classifier_tensors": len(classifier_params),
         "num_classifier_parameters": _count_param_numel(classifier_params),
+    }
+
+
+def _resolve_num_warmup_steps(args, total_train_steps):
+    if args.num_warmup_steps and args.num_warmup_steps > 0:
+        return int(args.num_warmup_steps)
+    if args.warmup_ratio and args.warmup_ratio > 0:
+        return int(total_train_steps * args.warmup_ratio)
+    return 0
+
+
+def _build_scheduler(optimizer, args, total_train_steps):
+    warmup_steps = _resolve_num_warmup_steps(args, total_train_steps)
+    if args.lr_scheduler_type == "none" or total_train_steps <= 0:
+        return None, {
+            "scheduler_type": "none",
+            "num_training_steps": int(total_train_steps),
+            "num_warmup_steps": int(warmup_steps),
+        }
+
+    if args.lr_scheduler_type != "linear":
+        raise ValueError(f"Unsupported lr_scheduler_type: {args.lr_scheduler_type}")
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_train_steps,
+    )
+    return scheduler, {
+        "scheduler_type": "linear",
+        "num_training_steps": int(total_train_steps),
+        "num_warmup_steps": int(warmup_steps),
     }
 
 
@@ -303,13 +335,15 @@ def main():
 
     optimizer, optimizer_summary = _build_optimizer(model, args)
     trainable_params = [param for param in model.parameters() if getattr(param, "requires_grad", False)]
+    scheduler, scheduler_summary = _build_scheduler(optimizer, args, args.max_train_steps)
     logger.info(
-        "[plain-%s] replaced_layers=%s trainable_tensors=%s trainable_parameters=%s optimizer=%s",
+        "[plain-%s] replaced_layers=%s trainable_tensors=%s trainable_parameters=%s optimizer=%s scheduler=%s",
         args.adapter_type,
         len(replaced_layers),
         len(trainable_params),
         _count_param_numel(trainable_params),
         optimizer_summary,
+        scheduler_summary,
     )
 
     train_dataloader = DataLoader(
@@ -346,6 +380,8 @@ def main():
             loss = outputs.loss
             loss.backward()
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
             global_step += 1
             loss_value = float(loss.detach().item())
@@ -402,6 +438,7 @@ def main():
         "learning_rate": args.learning_rate,
         "classifier_learning_rate": args.classifier_learning_rate,
         "optimizer_summary": optimizer_summary,
+        "lr_scheduler_summary": scheduler_summary,
         "lora_target_modules": args.lora_target_modules,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,

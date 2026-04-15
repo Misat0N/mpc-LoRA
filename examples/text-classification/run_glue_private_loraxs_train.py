@@ -30,6 +30,8 @@ def _inject_default_argv(argv):
         patched.extend(["--model_name_or_path", "bert-base-uncased"])
     if not _contains_cli_arg(patched, "--task_name"):
         patched.extend(["--task_name", "sst2"])
+    if not _contains_cli_arg(patched, "--adapter_type_label"):
+        patched.extend(["--adapter_type_label", "loraxs"])
     if not _contains_cli_arg(patched, "--lora_target_modules"):
         patched.extend(["--lora_target_modules", "query,key,value"])
     if not _contains_cli_arg(patched, "--lora_dropout"):

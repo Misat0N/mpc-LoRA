@@ -6,11 +6,11 @@ MODEL_NAME="${MODEL_NAME:-bert-base-uncased}"
 GPU_IDS="${GPU_IDS:-0,1}"
 SEED="${SEED:-42}"
 
-MAX_LENGTH="${MAX_LENGTH:-64}"
-LEN_DATA="${LEN_DATA:-64}"
-MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-120}"
-LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-5}"
-EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-128}"
+MAX_LENGTH="${MAX_LENGTH:-128}"
+LEN_DATA="${LEN_DATA:-128}"
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-600}"
+LOG_EVERY_STEPS="${LOG_EVERY_STEPS:-10}"
+EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-256}"
 
 TRAIN_MAX_SAMPLES="${TRAIN_MAX_SAMPLES:--1}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:--1}"
@@ -25,6 +25,8 @@ LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-query,value,attention.output.dense,o
 LEARNING_RATE="${LEARNING_RATE:-5e-4}"
 CLASSIFIER_LEARNING_RATE="${CLASSIFIER_LEARNING_RATE:-2e-4}"
 MOMENTUM="${MOMENTUM:-0.9}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.06}"
 ENCRYPTED_PARAM_KEYWORDS="${ENCRYPTED_PARAM_KEYWORDS:-lora_A.,lora_B.,classifier.,score.}"
 
 RUN_TAG="${RUN_TAG:-lora_recipe_$(date +%Y%m%d_%H%M%S)}"
@@ -72,6 +74,9 @@ python run_glue_private_loraxs_recipe_lora_train.py \
   --learning_rate "${LEARNING_RATE}" \
   --classifier_learning_rate "${CLASSIFIER_LEARNING_RATE}" \
   --momentum "${MOMENTUM}" \
+  --weight_decay "${WEIGHT_DECAY}" \
+  --lr_scheduler_type linear \
+  --warmup_ratio "${WARMUP_RATIO}" \
   --public_non_lora_weights \
   --encrypted_param_keywords "${ENCRYPTED_PARAM_KEYWORDS}" \
   --output_dir "${OUT_DIR}" \

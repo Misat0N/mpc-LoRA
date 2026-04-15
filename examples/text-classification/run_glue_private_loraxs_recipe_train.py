@@ -35,6 +35,10 @@ def _inject_default_argv(argv):
         patched.extend(["--model_name_or_path", "bert-base-uncased"])
     if not _contains_cli_arg(patched, "--task_name"):
         patched.extend(["--task_name", "sst2"])
+    if not _contains_cli_arg(patched, "--adapter_type_label"):
+        patched.extend(["--adapter_type_label", "loraxs"])
+    if not _contains_cli_arg(patched, "--max_length"):
+        patched.extend(["--max_length", "128"])
     if not _contains_cli_arg(patched, "--lora_target_modules"):
         patched.extend(
             ["--lora_target_modules", "query,value,attention.output.dense,output.dense"]
@@ -47,6 +51,10 @@ def _inject_default_argv(argv):
         patched.extend(["--encrypted_param_keywords", "lora_latent.,classifier.,score."])
     if not _contains_cli_arg(patched, "--classifier_learning_rate"):
         patched.extend(["--classifier_learning_rate", "2e-4"])
+    if not _contains_cli_arg(patched, "--lr_scheduler_type"):
+        patched.extend(["--lr_scheduler_type", "linear"])
+    if not _contains_cli_arg(patched, "--warmup_ratio"):
+        patched.extend(["--warmup_ratio", "0.06"])
 
     return patched
 

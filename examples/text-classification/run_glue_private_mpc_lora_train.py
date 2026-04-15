@@ -679,6 +679,57 @@ def _build_private_optimizer(private_model, args):
     }
 
 
+def _resolve_num_warmup_steps(args, total_train_steps):
+    if getattr(args, "num_warmup_steps", 0) and args.num_warmup_steps > 0:
+        return int(args.num_warmup_steps)
+    if getattr(args, "warmup_ratio", 0.0) and args.warmup_ratio > 0:
+        return int(total_train_steps * args.warmup_ratio)
+    return 0
+
+
+def _compute_linear_lr_scale(current_step, total_train_steps, warmup_steps):
+    if total_train_steps <= 0:
+        return 1.0
+    if warmup_steps > 0 and current_step < warmup_steps:
+        return float(current_step) / float(max(1, warmup_steps))
+    if current_step >= total_train_steps:
+        return 0.0
+    if total_train_steps <= warmup_steps:
+        return 1.0
+    decay_progress = float(total_train_steps - current_step) / float(max(1, total_train_steps - warmup_steps))
+    return max(0.0, decay_progress)
+
+
+def _configure_private_lr_schedule(optimizer, args, total_train_steps):
+    for group in optimizer.param_groups:
+        group.setdefault("initial_lr", group["lr"])
+
+    warmup_steps = _resolve_num_warmup_steps(args, total_train_steps)
+    summary = {
+        "scheduler_type": getattr(args, "lr_scheduler_type", "none"),
+        "num_training_steps": int(total_train_steps),
+        "num_warmup_steps": int(warmup_steps),
+    }
+
+    if args.lr_scheduler_type == "none" or total_train_steps <= 0:
+        return summary
+    if args.lr_scheduler_type != "linear":
+        raise ValueError(f"Unsupported lr_scheduler_type: {args.lr_scheduler_type}")
+
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * _compute_linear_lr_scale(0, total_train_steps, warmup_steps)
+    return summary
+
+
+def _step_private_lr_schedule(optimizer, args, current_step, total_train_steps):
+    if args.lr_scheduler_type == "none" or total_train_steps <= 0:
+        return
+    warmup_steps = _resolve_num_warmup_steps(args, total_train_steps)
+    scale = _compute_linear_lr_scale(current_step, total_train_steps, warmup_steps)
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * scale
+
+
 class LoRALinear(nn.Module):
     def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
         super().__init__()
@@ -1037,6 +1088,12 @@ def parse_args():
         help="Maximum number of evaluation steps after training. -1 means full eval split.",
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the output.")
+    parser.add_argument(
+        "--adapter_type_label",
+        type=str,
+        default=None,
+        help="Optional label written into the training summary for downstream comparison scripts.",
+    )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--trust_remote_code",
@@ -1145,6 +1202,25 @@ def parse_args():
             "Optional learning-rate override for classifier / score parameters. "
             "If unset, --learning_rate is used for every trainable parameter."
         ),
+    )
+    parser.add_argument(
+        "--lr_scheduler_type",
+        type=str,
+        default="none",
+        choices=["none", "linear"],
+        help="Learning-rate scheduler to apply on top of the MPC optimizer.",
+    )
+    parser.add_argument(
+        "--num_warmup_steps",
+        type=int,
+        default=0,
+        help="Absolute number of warmup steps for the MPC learning-rate scheduler.",
+    )
+    parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.0,
+        help="Warmup ratio used when --num_warmup_steps is not set.",
     )
     parser.add_argument(
         "--momentum",
@@ -1715,10 +1791,12 @@ def main():
 
     private_model.train()
     optimizer, optimizer_summary = _build_private_optimizer(private_model, args)
+    scheduler_summary = _configure_private_lr_schedule(optimizer, args, args.max_train_steps)
     logger.info(
-        "[rank %s] model set to train mode; optimizer initialized %s",
+        "[rank %s] model set to train mode; optimizer initialized %s scheduler=%s",
         rank,
         optimizer_summary,
+        scheduler_summary,
     )
     # 模型不加密
     # private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy)).to(device)
@@ -1911,6 +1989,7 @@ def main():
                 clear_current_reuse_step()
             logger.exception("[rank %s] train_step=%03d optimizer_step_failed", rank, global_step)
             raise
+        _step_private_lr_schedule(optimizer, args, global_step + 1, args.max_train_steps)
         _synchronize_timing_device(device)
         optimizer_end = time.perf_counter()
         logger.info("[rank %s] train_step=%03d optimizer_step_done", rank, global_step)
@@ -2219,6 +2298,7 @@ def main():
             "train_steps": global_step,
             "private_eval_metric": private_eval_metric,
             "plain_eval_metric": plain_eval_metric,
+            "adapter_type": args.adapter_type_label,
             "task_name": args.task_name,
             "max_train_steps": args.max_train_steps,
             "eval_max_steps": args.eval_max_steps,
@@ -2232,6 +2312,7 @@ def main():
             "learning_rate": args.learning_rate,
             "classifier_learning_rate": args.classifier_learning_rate,
             "optimizer_summary": optimizer_summary,
+            "lr_scheduler_summary": scheduler_summary,
             "trainable_param_summary": trainable_param_summary,
             "publicized_param_summary": publicized_param_summary,
             "final_comm_stats": ct.get_communication_stats(),

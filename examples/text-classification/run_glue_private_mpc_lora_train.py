@@ -801,8 +801,74 @@ class LoRALinear(nn.Module):
         return result
 
 
+def _shape_after_permute(shape, perm):
+    if shape is None:
+        return None
+    if len(shape) != len(perm):
+        return None
+    try:
+        return tuple(shape[index] for index in perm)
+    except Exception:
+        return None
+
+
+def _resolve_crypten_graph_tensor_shape(graph_module, node_name, _seen=None):
+    if _seen is None:
+        _seen = set()
+    if node_name in _seen:
+        return None
+    _seen.add(node_name)
+
+    child = graph_module._modules.get(node_name)
+    if child is None:
+        return None
+
+    if hasattr(child, "data") and hasattr(child.data, "size"):
+        try:
+            return tuple(int(dim) for dim in child.data.size())
+        except Exception:
+            pass
+
+    if hasattr(child, "weight") and hasattr(child.weight, "size"):
+        try:
+            base_shape = tuple(int(dim) for dim in child.weight.size())
+        except Exception:
+            base_shape = None
+        perm = getattr(child, "perm", None)
+        if perm is not None:
+            return _shape_after_permute(base_shape, perm)
+        return base_shape
+
+    if isinstance(child, ct.nn.Transpose):
+        input_names = graph_module._graph.get(node_name, [])
+        if len(input_names) != 1:
+            return None
+        input_shape = _resolve_crypten_graph_tensor_shape(graph_module, input_names[0], _seen=_seen)
+        return _shape_after_permute(input_shape, child.perm)
+
+    return None
+
+
+def _infer_crypten_matmul_io_features(graph_module, node_name, matmul_module):
+    if hasattr(matmul_module, "weight") and hasattr(matmul_module.weight, "size"):
+        try:
+            weight_shape = tuple(int(dim) for dim in matmul_module.weight.size())
+            if len(weight_shape) == 2:
+                return int(weight_shape[0]), int(weight_shape[1])
+        except Exception:
+            pass
+
+    input_names = graph_module._graph.get(node_name, [])
+    if len(input_names) < 2:
+        return None, None
+    rhs_shape = _resolve_crypten_graph_tensor_shape(graph_module, input_names[1])
+    if rhs_shape is None or len(rhs_shape) != 2:
+        return None, None
+    return int(rhs_shape[0]), int(rhs_shape[1])
+
+
 class CrypTenLoRALinear(ct.nn.Module):
-    def __init__(self, base_layer, r=8, alpha=16, dropout=0.0):
+    def __init__(self, base_layer, r=8, alpha=16, dropout=0.0, matmul_in_features=None, matmul_out_features=None):
         super().__init__()
         if not isinstance(base_layer, (ct.nn.Linear, ct.nn.MatMul)):
             raise TypeError(
@@ -824,8 +890,12 @@ class CrypTenLoRALinear(ct.nn.Module):
                 in_features = int(self.base.weight.size(1))
                 out_features = int(self.base.weight.size(0))
             else:
-                in_features = int(self.base.weight.size(0))
-                out_features = int(self.base.weight.size(1))
+                in_features = int(matmul_in_features) if matmul_in_features is not None else None
+                out_features = int(matmul_out_features) if matmul_out_features is not None else None
+                if in_features is None or out_features is None:
+                    raise RuntimeError(
+                        "CrypTenLoRALinear(MatMul) requires inferred input/output feature sizes."
+                    )
             self.lora_A = ct.nn.Linear(in_features, self.r, bias=False)
             self.lora_B = ct.nn.Linear(self.r, out_features, bias=False)
             torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
@@ -874,10 +944,25 @@ def _inject_crypten_lora_layers(module, target_keywords, r, alpha, dropout, pref
     for child_name, child in list(module.named_children()):
         full_name = f"{prefix}.{child_name}" if prefix else child_name
         if isinstance(child, (ct.nn.Linear, ct.nn.MatMul)) and any(k in full_name for k in target_keywords):
+            matmul_in_features = None
+            matmul_out_features = None
+            if isinstance(child, ct.nn.MatMul):
+                matmul_in_features, matmul_out_features = _infer_crypten_matmul_io_features(
+                    module,
+                    child_name,
+                    child,
+                )
             _replace_child_module(
                 module,
                 child_name,
-                CrypTenLoRALinear(child, r=r, alpha=alpha, dropout=dropout),
+                CrypTenLoRALinear(
+                    child,
+                    r=r,
+                    alpha=alpha,
+                    dropout=dropout,
+                    matmul_in_features=matmul_in_features,
+                    matmul_out_features=matmul_out_features,
+                ),
             )
             replaced.append(full_name)
         else:

@@ -618,6 +618,41 @@ def _count_param_numel(params):
     return total
 
 
+def _normalize_private_param_name(name):
+    if str(name).endswith(".data"):
+        return str(name)[:-5]
+    return str(name)
+
+
+def _apply_private_trainable_mask(private_model, trainable_names):
+    expected = {str(name) for name in trainable_names}
+    matched = []
+    unmatched = sorted(expected)
+
+    for name, param in private_model.named_parameters():
+        normalized_name = _normalize_private_param_name(name)
+        should_train = normalized_name in expected
+        if hasattr(param, "requires_grad"):
+            param.requires_grad = should_train
+        if should_train:
+            matched.append(normalized_name)
+
+    matched_set = set(matched)
+    unmatched = [name for name in unmatched if name not in matched_set]
+    trainable_params = [
+        param for param in private_model.parameters() if getattr(param, "requires_grad", False)
+    ]
+    return {
+        "num_trainable_tensors": len(trainable_params),
+        "num_trainable_parameters": _count_param_numel(trainable_params),
+        "matched_trainable_names": len(matched_set),
+        "expected_trainable_names": len(expected),
+        "unmatched_trainable_name_count": len(unmatched),
+        "unmatched_trainable_preview": unmatched[:24],
+        "trainable_preview": sorted(matched_set)[:24],
+    }
+
+
 def _build_private_optimizer(private_model, args):
     grad_threshold = args.grad_threshold if args.grad_threshold > 0 else None
     classifier_lr = getattr(args, "classifier_learning_rate", None)
@@ -1789,6 +1824,10 @@ def main():
         if rank == 0:
             logger.info("[public-non-lora] summary=%s", publicized_param_summary)
 
+    private_trainable_param_summary = _apply_private_trainable_mask(private_model, trainable_names)
+    if rank == 0:
+        logger.info("[private-train-params] summary=%s", private_trainable_param_summary)
+
     private_model.train()
     optimizer, optimizer_summary = _build_private_optimizer(private_model, args)
     scheduler_summary = _configure_private_lr_schedule(optimizer, args, args.max_train_steps)
@@ -2314,6 +2353,7 @@ def main():
             "optimizer_summary": optimizer_summary,
             "lr_scheduler_summary": scheduler_summary,
             "trainable_param_summary": trainable_param_summary,
+            "private_trainable_param_summary": private_trainable_param_summary,
             "publicized_param_summary": publicized_param_summary,
             "final_comm_stats": ct.get_communication_stats(),
             "total_elapsed_s": total_elapsed_s,

@@ -55,8 +55,6 @@ class Module:
 
     def train(self, mode=True):
         """Sets the module in the specified training mode."""
-        for param in self.parameters():
-            param.requires_grad = mode
         self.training = mode
 
         # Recursively set train mode

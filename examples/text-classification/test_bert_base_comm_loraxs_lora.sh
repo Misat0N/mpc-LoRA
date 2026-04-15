@@ -46,6 +46,9 @@ fi
 if [[ "${EXPERIMENTAL_REUSE_MASK:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--experimental_reuse_mask)
 fi
+if [[ "${REUSE_PROFILE:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--reuse_profile)
+fi
 if [[ -n "${REUSE_MODE:-}" ]]; then
   EXTRA_ARGS+=(--reuse_mode "${REUSE_MODE}")
 fi
@@ -54,6 +57,9 @@ if [[ -n "${SHARED_LEFT_MIN_FANOUT:-}" ]]; then
 fi
 if [[ -n "${SHARED_LEFT_LOG_GROUPS:-}" ]]; then
   EXTRA_ARGS+=(--shared_left_log_groups "${SHARED_LEFT_LOG_GROUPS}")
+fi
+if [[ -n "${REUSE_LOG_EVERY_STEPS:-}" ]]; then
+  EXTRA_ARGS+=(--reuse_log_every_steps "${REUSE_LOG_EVERY_STEPS}")
 fi
 
 echo "[loraxs-lora] output_dir=${OUT_DIR}"

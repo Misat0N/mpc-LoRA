@@ -824,12 +824,14 @@ def _apply_lora_b_export_sentinels(model, sentinel_scale):
     for module_name, module in model.named_modules():
         if not isinstance(module, LoRALinear):
             continue
-        if module.r <= 0 or module.lora_B is None:
+        module_r = getattr(module, "r", 0)
+        module_lora_b = getattr(module, "lora_B", None)
+        if module_r <= 0 or module_lora_b is None:
             continue
         sentinel_value = _stable_lora_export_sentinel(module_name, scale)
         with torch.no_grad():
-            module.lora_B.weight.zero_()
-            flat = module.lora_B.weight.view(-1)
+            module_lora_b.weight.zero_()
+            flat = module_lora_b.weight.view(-1)
             flat[0] = flat.new_tensor(sentinel_value)
         if len(applied) < 24:
             applied.append(
@@ -842,7 +844,13 @@ def _apply_lora_b_export_sentinels(model, sentinel_scale):
     return {
         "enabled": True,
         "sentinel_scale": scale,
-        "num_modules": sum(1 for _, module in model.named_modules() if isinstance(module, LoRALinear) and module.r > 0 and module.lora_B is not None),
+        "num_modules": sum(
+            1
+            for _, module in model.named_modules()
+            if isinstance(module, LoRALinear)
+            and getattr(module, "r", 0) > 0
+            and getattr(module, "lora_B", None) is not None
+        ),
         "preview": applied,
     }
 
@@ -852,10 +860,12 @@ def _zero_pytorch_lora_b_weights(model):
     for _, module in model.named_modules():
         if not isinstance(module, LoRALinear):
             continue
-        if module.r <= 0 or module.lora_B is None:
+        module_r = getattr(module, "r", 0)
+        module_lora_b = getattr(module, "lora_B", None)
+        if module_r <= 0 or module_lora_b is None:
             continue
         with torch.no_grad():
-            module.lora_B.weight.zero_()
+            module_lora_b.weight.zero_()
         zeroed += 1
     return zeroed
 
@@ -1860,12 +1870,6 @@ def main():
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
         )
-        lora_b_export_sentinel_summary = _apply_lora_b_export_sentinels(
-            model,
-            args.lora_b_export_sentinel_scale,
-        )
-        if int(os.environ.get("RANK", "0")) == 0 and lora_b_export_sentinel_summary.get("enabled"):
-            logger.info("[lora-b-export-sentinel] summary=%s", lora_b_export_sentinel_summary)
 
     if len(replaced_lora_modules) == 0:
         raise ValueError(
@@ -1882,6 +1886,14 @@ def main():
         logger.warning(
             "[train-params] --train_classifier_only is enabled. This overrides LoRA trainability selection."
         )
+    uses_trainable_lora_b = any("lora_B." in str(name) for name in trainable_names)
+    if (not args.crypten_native_lora) and uses_trainable_lora_b:
+        lora_b_export_sentinel_summary = _apply_lora_b_export_sentinels(
+            model,
+            args.lora_b_export_sentinel_scale,
+        )
+        if int(os.environ.get("RANK", "0")) == 0 and lora_b_export_sentinel_summary.get("enabled"):
+            logger.info("[lora-b-export-sentinel] summary=%s", lora_b_export_sentinel_summary)
     trainable_params = [
         param for param in trainable_reference_model.parameters() if getattr(param, "requires_grad", False)
     ]
@@ -2083,7 +2095,7 @@ def main():
                 len(replaced_private_lora_modules),
                 replaced_private_lora_modules[:12],
             )
-    else:
+    elif uses_trainable_lora_b:
         restored_pytorch_lora_b = _zero_pytorch_lora_b_weights(model)
         restored_private_lora_b = _zero_private_lora_b_weights(private_model)
         lora_b_post_export_restore_summary = {

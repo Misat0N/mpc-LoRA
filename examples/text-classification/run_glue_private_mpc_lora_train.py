@@ -21,6 +21,7 @@ import builtins
 from collections import defaultdict, deque
 import copy
 import json
+import hashlib
 import logging
 import math
 import os
@@ -801,6 +802,81 @@ class LoRALinear(nn.Module):
         return result
 
 
+def _stable_lora_export_sentinel(module_name, scale):
+    digest = hashlib.sha1(str(module_name).encode("utf-8")).digest()
+    raw = int.from_bytes(digest[:8], byteorder="big", signed=False)
+    bucket = 1 + (raw % 1000000)
+    return float(scale) * float(bucket)
+
+
+def _apply_lora_b_export_sentinels(model, sentinel_scale):
+    if sentinel_scale is None or float(sentinel_scale) <= 0:
+        return {
+            "enabled": False,
+            "sentinel_scale": float(sentinel_scale or 0.0),
+            "num_modules": 0,
+            "preview": [],
+        }
+
+    applied = []
+    scale = float(sentinel_scale)
+    for module_name, module in model.named_modules():
+        if not isinstance(module, LoRALinear):
+            continue
+        if module.r <= 0 or module.lora_B is None:
+            continue
+        sentinel_value = _stable_lora_export_sentinel(module_name, scale)
+        with torch.no_grad():
+            module.lora_B.weight.zero_()
+            flat = module.lora_B.weight.view(-1)
+            flat[0] = flat.new_tensor(sentinel_value)
+        if len(applied) < 24:
+            applied.append(
+                {
+                    "module": module_name,
+                    "sentinel": float(sentinel_value),
+                }
+            )
+
+    return {
+        "enabled": True,
+        "sentinel_scale": scale,
+        "num_modules": sum(1 for _, module in model.named_modules() if isinstance(module, LoRALinear) and module.r > 0 and module.lora_B is not None),
+        "preview": applied,
+    }
+
+
+def _zero_pytorch_lora_b_weights(model):
+    zeroed = 0
+    for _, module in model.named_modules():
+        if not isinstance(module, LoRALinear):
+            continue
+        if module.r <= 0 or module.lora_B is None:
+            continue
+        with torch.no_grad():
+            module.lora_B.weight.zero_()
+        zeroed += 1
+    return zeroed
+
+
+def _zero_private_lora_b_weights(private_model):
+    zeroed = 0
+    preview = []
+    for name, param in private_model.named_parameters():
+        if "lora_B." not in str(name):
+            continue
+        if hasattr(param, "zero_"):
+            with torch.no_grad():
+                param.zero_()
+            zeroed += 1
+            if len(preview) < 24:
+                preview.append(str(name))
+    return {
+        "zeroed_lora_B_tensors": zeroed,
+        "preview": preview,
+    }
+
+
 def _shape_after_permute(shape, perm):
     if shape is None:
         return None
@@ -1373,6 +1449,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--lora_b_export_sentinel_scale",
+        type=float,
+        default=1e-9,
+        help=(
+            "Tiny per-module sentinel written into LoRA-B before ONNX export to "
+            "prevent identical zero-initialized LoRA-B tensors from being merged. "
+            "Set to 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--public_non_lora_weights",
         action="store_true",
         help=(
@@ -1739,6 +1825,7 @@ def main():
     lora_targets = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
     recovery_template_model = model
     trainable_reference_model = model
+    lora_b_export_sentinel_summary = None
 
     if args.crypten_native_lora:
         recovery_template_model = copy.deepcopy(model)
@@ -1761,6 +1848,12 @@ def main():
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
         )
+        lora_b_export_sentinel_summary = _apply_lora_b_export_sentinels(
+            model,
+            args.lora_b_export_sentinel_scale,
+        )
+        if rank == 0 and lora_b_export_sentinel_summary.get("enabled"):
+            logger.info("[lora-b-export-sentinel] summary=%s", lora_b_export_sentinel_summary)
 
     if len(replaced_lora_modules) == 0:
         raise ValueError(
@@ -1959,6 +2052,7 @@ def main():
     # exit()
     dummy = torch.zeros_like(model.dummy_inputs["input_ids"])
     private_model = ct.nn.from_pytorch(model, (dummy, dummy, dummy))
+    lora_b_post_export_restore_summary = None
     if args.crypten_native_lora:
         replaced_private_lora_modules = _inject_crypten_lora_layers(
             private_model,
@@ -1976,6 +2070,18 @@ def main():
                 "[crypten-native-lora] injected=%s first_modules=%s",
                 len(replaced_private_lora_modules),
                 replaced_private_lora_modules[:12],
+            )
+    else:
+        restored_pytorch_lora_b = _zero_pytorch_lora_b_weights(model)
+        restored_private_lora_b = _zero_private_lora_b_weights(private_model)
+        lora_b_post_export_restore_summary = {
+            "restored_pytorch_lora_B_tensors": restored_pytorch_lora_b,
+            **restored_private_lora_b,
+        }
+        if rank == 0 and lora_b_export_sentinel_summary and lora_b_export_sentinel_summary.get("enabled"):
+            logger.info(
+                "[lora-b-export-sentinel] restored_zero_init=%s",
+                lora_b_post_export_restore_summary,
             )
     private_model = private_model.encrypt().to(device)
     shared_left_group_summary = None
@@ -2559,6 +2665,8 @@ def main():
             "shared_left_group_summary": shared_left_group_summary,
             "reuse_profile_summary": reuse_profile_summary,
             "numeric_probe_summary": numeric_probe_summary,
+            "lora_b_export_sentinel_summary": lora_b_export_sentinel_summary,
+            "lora_b_post_export_restore_summary": lora_b_post_export_restore_summary,
             "public_non_lora_weights": args.public_non_lora_weights,
             "encrypted_param_keywords": args.encrypted_param_keywords,
             "learning_rate": args.learning_rate,

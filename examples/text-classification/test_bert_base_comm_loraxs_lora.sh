@@ -22,6 +22,7 @@ LORA_R="${LORA_R:-8}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.0}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-query,key,value}"
+LORA_B_EXPORT_SENTINEL_SCALE="${LORA_B_EXPORT_SENTINEL_SCALE:-1e-9}"
 LEARNING_RATE="${LEARNING_RATE:-5e-4}"
 MOMENTUM="${MOMENTUM:-0.9}"
 ENCRYPTED_PARAM_KEYWORDS="${ENCRYPTED_PARAM_KEYWORDS:-lora_A.,lora_B.,classifier.,score.}"
@@ -65,6 +66,7 @@ fi
 echo "[loraxs-lora] output_dir=${OUT_DIR}"
 echo "[loraxs-lora] task=${TASK_NAME} model=${MODEL_NAME} gpu_ids=${GPU_IDS} steps=${MAX_TRAIN_STEPS}"
 echo "[loraxs-lora] targets=${LORA_TARGET_MODULES} lora_r=${LORA_R} lora_alpha=${LORA_ALPHA} lora_dropout=${LORA_DROPOUT}"
+echo "[loraxs-lora] lora_b_export_sentinel_scale=${LORA_B_EXPORT_SENTINEL_SCALE}"
 echo "[loraxs-lora] encrypted_keywords=${ENCRYPTED_PARAM_KEYWORDS}"
 
 python run_glue_private_loraxs_lora_train.py \
@@ -86,6 +88,7 @@ python run_glue_private_loraxs_lora_train.py \
   --lora_alpha "${LORA_ALPHA}" \
   --lora_dropout "${LORA_DROPOUT}" \
   --lora_target_modules "${LORA_TARGET_MODULES}" \
+  --lora_b_export_sentinel_scale "${LORA_B_EXPORT_SENTINEL_SCALE}" \
   --learning_rate "${LEARNING_RATE}" \
   --momentum "${MOMENTUM}" \
   --public_non_lora_weights \

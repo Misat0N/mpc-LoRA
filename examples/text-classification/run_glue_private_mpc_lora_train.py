@@ -1852,7 +1852,7 @@ def main():
             model,
             args.lora_b_export_sentinel_scale,
         )
-        if rank == 0 and lora_b_export_sentinel_summary.get("enabled"):
+        if int(os.environ.get("RANK", "0")) == 0 and lora_b_export_sentinel_summary.get("enabled"):
             logger.info("[lora-b-export-sentinel] summary=%s", lora_b_export_sentinel_summary)
 
     if len(replaced_lora_modules) == 0:

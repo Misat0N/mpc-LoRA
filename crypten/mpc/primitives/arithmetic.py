@@ -8,6 +8,7 @@
 import crypten.communicator as comm
 
 # dependencies:
+import time
 import torch
 from crypten.common.functions import regular
 from crypten.common.rng import generate_random_ring_element
@@ -18,7 +19,7 @@ from crypten.cryptensor import CrypTensor
 from crypten.cuda import CUDALongTensor
 from crypten.encoder import FixedPointEncoder
 
-from . import beaver, replicated  # noqa: F401
+from . import beaver, matmul_profile, replicated  # noqa: F401
 
 
 SENTINEL = -1
@@ -358,6 +359,8 @@ class ArithmeticSharedTensor(object):
         else:
             result = self.clone()
 
+        profile_matmul = op == "matmul" and matmul_profile.is_enabled()
+
         if public:
             y = result.encoder.encode(y, device=self.device)
 
@@ -369,7 +372,14 @@ class ArithmeticSharedTensor(object):
             elif op == "mul_":  # ['mul_']
                 result.share = result.share.mul_(y)
             else:  # ['mul', 'matmul', 'convNd', 'conv_transposeNd']
-                result.share = getattr(torch, op)(result.share, y, *args, **kwargs)
+                if profile_matmul:
+                    lhs_share = result.share
+                    rhs_share = y
+                    start_time = time.perf_counter()
+                    result.share = getattr(torch, op)(lhs_share, rhs_share, *args, **kwargs)
+                    matmul_profile.record("public", lhs_share, rhs_share, time.perf_counter() - start_time)
+                else:
+                    result.share = getattr(torch, op)(result.share, y, *args, **kwargs)
         elif private:
             if additive_func:  # ['add', 'sub', 'add_', 'sub_']
                 # Re-encode if necessary:
@@ -380,9 +390,17 @@ class ArithmeticSharedTensor(object):
                 result.share = getattr(result.share, op)(y.share)
             else:  # ['mul', 'matmul', 'convNd', 'conv_transposeNd']
                 protocol = globals()[cfg.mpc.protocol]
-                result.share.set_(
-                    getattr(protocol, op)(result, y, *args, **kwargs).share.data
-                )
+                if profile_matmul:
+                    lhs_share = result.share
+                    rhs_share = y.share
+                    start_time = time.perf_counter()
+                    protocol_result = getattr(protocol, op)(result, y, *args, **kwargs)
+                    matmul_profile.record("private", lhs_share, rhs_share, time.perf_counter() - start_time)
+                    result.share.set_(protocol_result.share.data)
+                else:
+                    result.share.set_(
+                        getattr(protocol, op)(result, y, *args, **kwargs).share.data
+                    )
         else:
             raise TypeError("Cannot %s %s with %s" % (op, type(y), type(self)))
 

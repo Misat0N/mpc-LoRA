@@ -55,6 +55,7 @@ import crypten as ct
 from crypten.common.reuse_context import clear_current_reuse_step, set_current_reuse_step
 from crypten.config import cfg
 from crypten.mpc.primitives import beaver as beaver_protocol
+from crypten.mpc.primitives import matmul_profile
 from multiprocess_launcher import MultiProcessLauncher
 from shared_left_graph_groups import annotate_shared_left_groups_crypten_model
 
@@ -1625,6 +1626,17 @@ def parse_args():
         help="Logging interval for reuse runtime stats when --reuse_profile is enabled.",
     )
     parser.add_argument(
+        "--matmul_profile",
+        action="store_true",
+        help="Collect sec-sec / sec-pub matmul counts and timing during training.",
+    )
+    parser.add_argument(
+        "--matmul_log_every_steps",
+        type=int,
+        default=0,
+        help="If > 0, log cumulative matmul profile every N training steps.",
+    )
+    parser.add_argument(
         "--allow_spam_logs",
         action="store_true",
         help="If passed, do not filter verbose third-party debug prints (e.g. index_add debug).",
@@ -2207,6 +2219,7 @@ def main():
     global_step = 0
     reuse_runtime_profile = _new_reuse_runtime_profile() if args.reuse_profile else None
     numeric_probe_summary = None
+    matmul_profile.reset(enabled=args.matmul_profile)
     if args.reuse_profile:
         beaver_protocol.reset_reuse_stats(reset_cache=True)
         ct.reset_communication_stats()
@@ -2490,6 +2503,9 @@ def main():
                 len(recent_train_losses),
                 running_loss,
             )
+        if args.matmul_profile and rank == 0 and args.matmul_log_every_steps > 0:
+            if global_step % max(1, args.matmul_log_every_steps) == 0:
+                logger.info("[matmul-profile] step=%03d summary=%s", global_step, matmul_profile.summary())
         if args.max_train_steps > 0 and global_step >= args.max_train_steps:
             logger.info("[rank %s] reached max_train_steps=%s", rank, args.max_train_steps)
             break
@@ -2498,6 +2514,11 @@ def main():
         reuse_profile_summary = _finalize_reuse_runtime_profile(reuse_runtime_profile)
         if rank == 0:
             logger.info("[reuse-profile] summary=%s", reuse_profile_summary)
+    matmul_profile_summary = None
+    if args.matmul_profile:
+        matmul_profile_summary = matmul_profile.summary()
+        if rank == 0:
+            logger.info("[matmul-profile] summary=%s", matmul_profile_summary)
     logger.info(
         "[rank %s] short-train finished steps=%s elapsed=%.3fs",
         rank,
@@ -2664,6 +2685,7 @@ def main():
             "reuse_mode": args.reuse_mode,
             "shared_left_group_summary": shared_left_group_summary,
             "reuse_profile_summary": reuse_profile_summary,
+            "matmul_profile_summary": matmul_profile_summary,
             "numeric_probe_summary": numeric_probe_summary,
             "lora_b_export_sentinel_summary": lora_b_export_sentinel_summary,
             "lora_b_post_export_restore_summary": lora_b_post_export_restore_summary,

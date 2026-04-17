@@ -50,6 +50,12 @@ fi
 if [[ "${REUSE_PROFILE:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--reuse_profile)
 fi
+if [[ "${MATMUL_PROFILE:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--matmul_profile)
+fi
+if [[ -n "${MATMUL_LOG_EVERY_STEPS:-}" ]]; then
+  EXTRA_ARGS+=(--matmul_log_every_steps "${MATMUL_LOG_EVERY_STEPS}")
+fi
 if [[ -n "${REUSE_MODE:-}" ]]; then
   EXTRA_ARGS+=(--reuse_mode "${REUSE_MODE}")
 fi

@@ -40,9 +40,16 @@ functions:
   # softmax configuration
   softmax_method: "ode"
   softmax_ode_clip: True
+  softmax_ode_center_by_max: False
+  softmax_ode_zero_masked: False
+  softmax_ode_mask_margin: 100.0
   softmax_ode_iter_num: 16
   softmax_ode_ub: 12
   softmax_ode_lb: -4
+
+  # sqrt NR tuning used by aligned private LoRA experiments.
+  sqrt_nr_initial_exp_iterations: null
+  sqrt_nr_linear_divisor: null
 
   # log configuration
   log_iterations: 2

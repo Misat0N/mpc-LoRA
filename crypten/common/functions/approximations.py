@@ -208,8 +208,16 @@ def inv_sqrt(self):
     elif method == "NR":
         # Initialize using decent approximation
         if initial is None:
-            y = exp(self.div(2).add(0.2).neg()).mul(2.2).add(0.2)
-            y = y - self.div(1024)
+            initial_exp_iterations = getattr(cfg.functions, "sqrt_nr_initial_exp_iterations", None)
+            if initial_exp_iterations is None:
+                y = exp(self.div(2).add(0.2).neg()).mul(2.2).add(0.2)
+            else:
+                with cfg.temp_override({"functions.exp_iterations": int(initial_exp_iterations)}):
+                    y = exp(self.div(2).add(0.2).neg()).mul(2.2).add(0.2)
+            linear_divisor = getattr(cfg.functions, "sqrt_nr_linear_divisor", None)
+            linear_divisor = 1024 if linear_divisor is None else float(linear_divisor)
+            if linear_divisor != 0:
+                y = y - self.div(linear_divisor)
         else:
             y = initial
 
@@ -638,6 +646,19 @@ def softmax(self, dim, **kwargs):
         iter_num = cfg.functions.softmax_ode_iter_num
         clip = cfg.functions.softmax_ode_clip
         upper, lower = cfg.functions.softmax_ode_ub, cfg.functions.softmax_ode_lb
+        center_by_max = bool(getattr(cfg.functions, "softmax_ode_center_by_max", False))
+        zero_masked = bool(getattr(cfg.functions, "softmax_ode_zero_masked", False))
+        mask_margin = float(getattr(cfg.functions, "softmax_ode_mask_margin", 100.0))
+
+        if center_by_max:
+            self = self - self.max(dim, keepdim=True)[0]
+
+        valid_mask = None
+        if zero_masked:
+            # BERT-style masks enter softmax as very negative logits. Capture
+            # those positions before clipping so ODE softmax does not assign
+            # probability mass to padded tokens.
+            valid_mask = self > (-mask_margin)
 
         if clip:
             # clip the input within the range [lower, upper] for numerical stability
@@ -651,6 +672,11 @@ def softmax(self, dim, **kwargs):
         # compute ode update formula
         for _ in range(iter_num):
             g = g + (x - g.mul(x).sum(dim=dim).unsqueeze(-1)).squeeze(-1) * g
+        if valid_mask is not None:
+            g = g * valid_mask
+            with cfg.temp_override({"functions.reciprocal_all_pos": True}):
+                inv_denominator = g.sum(dim, keepdim=True).reciprocal()
+            g = g * inv_denominator
         return g
     else:
         raise ValueError(f"Unrecognized method {method} for softmax")

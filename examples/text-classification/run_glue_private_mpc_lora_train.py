@@ -28,6 +28,10 @@ import os
 import sys
 import time
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import datasets
 import torch
 import torch.nn.functional as F
@@ -173,6 +177,26 @@ def _cfg_snapshot():
         snapshot["validation_mode"] = cfg.debug.validation_mode
     except Exception as err:
         snapshot["validation_mode"] = f"<error: {type(err).__name__}: {err}>"
+
+    try:
+        snapshot["softmax_method"] = cfg.functions.softmax_method
+    except Exception as err:
+        snapshot["softmax_method"] = f"<error: {type(err).__name__}: {err}>"
+    for key in (
+        "softmax_ode_iter_num",
+        "softmax_ode_clip",
+        "softmax_ode_center_by_max",
+        "softmax_ode_zero_masked",
+        "softmax_ode_mask_margin",
+        "sqrt_method",
+        "sqrt_nr_iters",
+        "sqrt_nr_initial_exp_iterations",
+        "sqrt_nr_linear_divisor",
+    ):
+        try:
+            snapshot[key] = getattr(cfg.functions, key)
+        except Exception:
+            pass
 
     return snapshot
 
@@ -656,7 +680,82 @@ def _apply_private_trainable_mask(private_model, trainable_names):
     }
 
 
+def _moving_average_last(values, window_size):
+    if not values:
+        return None
+    keep = values[-max(1, int(window_size)) :]
+    return sum(keep) / len(keep)
+
+
+def _apply_private_math_config(args):
+    if getattr(args, "softmax_method", None) is not None:
+        cfg.functions.softmax_method = args.softmax_method
+    if getattr(args, "softmax_ode_iter_num", None) is not None:
+        cfg.functions.softmax_ode_iter_num = args.softmax_ode_iter_num
+    if getattr(args, "softmax_ode_clip", None) is not None:
+        cfg.functions.softmax_ode_clip = args.softmax_ode_clip.lower() == "true"
+    if getattr(args, "softmax_ode_center_by_max", None) is not None:
+        cfg.functions.softmax_ode_center_by_max = args.softmax_ode_center_by_max.lower() == "true"
+    if getattr(args, "softmax_ode_zero_masked", None) is not None:
+        cfg.functions.softmax_ode_zero_masked = args.softmax_ode_zero_masked.lower() == "true"
+    if getattr(args, "softmax_ode_mask_margin", None) is not None:
+        cfg.functions.softmax_ode_mask_margin = args.softmax_ode_mask_margin
+    if getattr(args, "sqrt_method", None) is not None:
+        cfg.functions.sqrt_method = args.sqrt_method
+    if getattr(args, "sqrt_nr_iters", None) is not None:
+        cfg.functions.sqrt_nr_iters = args.sqrt_nr_iters
+    if getattr(args, "sqrt_nr_initial", None) is not None:
+        cfg.functions.sqrt_nr_initial = args.sqrt_nr_initial
+    if getattr(args, "sqrt_nr_initial_exp_iterations", None) is not None:
+        cfg.functions.sqrt_nr_initial_exp_iterations = args.sqrt_nr_initial_exp_iterations
+    if getattr(args, "sqrt_nr_linear_divisor", None) is not None:
+        cfg.functions.sqrt_nr_linear_divisor = args.sqrt_nr_linear_divisor
+
+
+def _private_cross_entropy_manual(logits_enc, labels_enc):
+    dim = -1 if logits_enc.dim() > 1 else 0
+    softmax = logits_enc.softmax(dim)
+    log_probs = softmax.mul(100).log().sub(4.605170)
+    loss_values = log_probs.mul(labels_enc).neg()
+    return loss_values.sum().div(labels_enc.size(0))
+
+
+def _compute_private_train_loss(logits_enc, labels, device, args):
+    num_labels = logits_enc.size(-1)
+    y_onehot = F.one_hot(labels, num_classes=num_labels).float()
+    y_enc = ct.cryptensor(y_onehot).to(device)
+
+    if args.private_loss_mode == "manual":
+        override_config = {}
+        if args.ce_softmax_method not in (None, "default"):
+            override_config["functions.softmax_method"] = args.ce_softmax_method
+        if args.ce_softmax_ode_lb is not None and (
+            args.ce_softmax_method == "ode" or cfg.functions.softmax_method == "ode"
+        ):
+            override_config["functions.softmax_ode_lb"] = args.ce_softmax_ode_lb
+        if override_config:
+            with cfg.temp_override(override_config):
+                return _private_cross_entropy_manual(logits_enc, y_enc), y_onehot
+        return _private_cross_entropy_manual(logits_enc, y_enc), y_onehot
+
+    if args.loss_type == "ce":
+        if args.ce_softmax_method in (None, "default"):
+            return logits_enc.cross_entropy(y_enc), y_onehot
+        with cfg.temp_override({"functions.softmax_method": args.ce_softmax_method}):
+            return logits_enc.cross_entropy(y_enc), y_onehot
+    if args.loss_type == "mse":
+        diff = logits_enc - y_enc
+        return (diff * diff).mean(), y_onehot
+    raise ValueError(f"Unsupported loss_type: {args.loss_type}")
+
+
 def _build_private_optimizer(private_model, args):
+    optimizer_name = getattr(args, "optimizer", "sgd")
+    if optimizer_name != "sgd":
+        raise NotImplementedError(
+            "This CrypTen checkout only exposes ct.optim.SGD; use --optimizer sgd for private training."
+        )
+
     grad_threshold = args.grad_threshold if args.grad_threshold > 0 else None
     classifier_lr = getattr(args, "classifier_learning_rate", None)
 
@@ -674,6 +773,7 @@ def _build_private_optimizer(private_model, args):
         )
         return optimizer, {
             "optimizer_type": "sgd_single_lr",
+            "optimizer": optimizer_name,
             "learning_rate": args.learning_rate,
             "classifier_learning_rate": None,
             "num_trainable_tensors": len(trainable_params),
@@ -708,6 +808,7 @@ def _build_private_optimizer(private_model, args):
     )
     return optimizer, {
         "optimizer_type": "sgd_grouped_lr",
+        "optimizer": optimizer_name,
         "learning_rate": args.learning_rate,
         "classifier_learning_rate": classifier_lr,
         "num_non_classifier_tensors": len(non_classifier_params),
@@ -1364,8 +1465,21 @@ def parse_args():
     parser.add_argument(
         "--eval_max_steps",
         type=int,
-        default=-1,
+        default=None,
         help="Maximum number of evaluation steps after training. -1 means full eval split.",
+    )
+    parser.add_argument(
+        "--max_eval_steps",
+        dest="eval_max_steps",
+        type=int,
+        default=None,
+        help="Alias for --eval_max_steps.",
+    )
+    parser.add_argument(
+        "--eval_every_steps",
+        type=int,
+        default=0,
+        help="Compatibility field for scripts that log planned private-eval interval.",
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the output.")
     parser.add_argument(
@@ -1421,6 +1535,16 @@ def parse_args():
         "--train_classifier_only",
         action="store_true",
         help="If passed, freeze encoder and train only classifier head parameters.",
+    )
+    parser.add_argument(
+        "--trainable_scope",
+        type=str,
+        default="lora",
+        choices=["lora", "full", "last_layer_classifier"],
+        help=(
+            "Compatibility flag for the aligned GLUE scripts. This implementation injects LoRA by default; "
+            "use --train_classifier_only for classifier-only training."
+        ),
     )
     parser.add_argument(
         "--lora_r",
@@ -1493,6 +1617,13 @@ def parse_args():
         help="Learning rate for MPC optimizer.",
     )
     parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="sgd",
+        choices=["sgd", "adamw"],
+        help="MPC optimizer. This checkout supports sgd for private encrypted parameters.",
+    )
+    parser.add_argument(
         "--classifier_learning_rate",
         type=float,
         default=None,
@@ -1515,6 +1646,13 @@ def parse_args():
         help="Absolute number of warmup steps for the MPC learning-rate scheduler.",
     )
     parser.add_argument(
+        "--warmup_steps",
+        dest="num_warmup_steps",
+        type=int,
+        default=0,
+        help="Alias for --num_warmup_steps.",
+    )
+    parser.add_argument(
         "--warmup_ratio",
         type=float,
         default=0.0,
@@ -1532,6 +1670,9 @@ def parse_args():
         default=0.0,
         help="Weight decay for MPC SGD optimizer.",
     )
+    parser.add_argument("--adam_beta1", type=float, default=0.9, help="Compatibility field for AdamW configs.")
+    parser.add_argument("--adam_beta2", type=float, default=0.999, help="Compatibility field for AdamW configs.")
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8, help="Compatibility field for AdamW configs.")
     parser.add_argument(
         "--nesterov",
         action="store_true",
@@ -1560,13 +1701,53 @@ def parse_args():
         "--ce_softmax_method",
         type=str,
         default="default",
-        choices=["default", "reciprocal", "ode"],
+        choices=["default", "ideal", "reciprocal", "ode"],
         help=(
             "Softmax approximation to use inside CrypTen cross-entropy. "
             "'default' keeps cfg.functions.softmax_method. "
             "Use 'reciprocal' only for explicit experiments."
         ),
     )
+    parser.add_argument(
+        "--private_loss_mode",
+        type=str,
+        default="standard",
+        choices=["manual", "standard"],
+        help="Use manual one-hot private CE or the standard CrypTen CE path.",
+    )
+    parser.add_argument("--ce_softmax_ode_lb", type=float, default=None)
+    parser.add_argument(
+        "--softmax_method",
+        type=str,
+        default=None,
+        choices=["ideal", "ode", "reciprocal"],
+        help="Global CrypTen softmax method used by private model ops.",
+    )
+    parser.add_argument("--softmax_ode_iter_num", type=int, default=None)
+    parser.add_argument(
+        "--softmax_ode_iter_source",
+        type=str,
+        default="fixed",
+        choices=["fixed", "predictor"],
+        help="Compatibility field; this script currently uses the fixed value when provided.",
+    )
+    parser.add_argument("--softmax_ode_predictor_batches", type=int, default=2)
+    parser.add_argument(
+        "--softmax_ode_predictor_device",
+        type=str,
+        default="cpu",
+        choices=["cpu", "cuda"],
+    )
+    parser.add_argument("--softmax_ode_predictor_candidates", type=str, default="15,16")
+    parser.add_argument("--softmax_ode_clip", type=str, default=None, choices=["true", "false"])
+    parser.add_argument("--softmax_ode_center_by_max", type=str, default=None, choices=["true", "false"])
+    parser.add_argument("--softmax_ode_zero_masked", type=str, default=None, choices=["true", "false"])
+    parser.add_argument("--softmax_ode_mask_margin", type=float, default=None)
+    parser.add_argument("--sqrt_method", type=str, default=None, choices=["NR", "ideal"])
+    parser.add_argument("--sqrt_nr_iters", type=int, default=None)
+    parser.add_argument("--sqrt_nr_initial", type=float, default=None)
+    parser.add_argument("--sqrt_nr_initial_exp_iterations", type=int, default=None)
+    parser.add_argument("--sqrt_nr_linear_divisor", type=float, default=None)
     parser.add_argument(
         "--train_loss_window",
         type=int,
@@ -1582,6 +1763,28 @@ def parse_args():
         "--skip_plain_eval",
         action="store_true",
         help="If passed, skip plaintext evaluation after decrypting model.",
+    )
+    parser.add_argument(
+        "--save_trained_model",
+        action="store_true",
+        help="If passed, decrypt and export the trained plaintext Hugging Face model under output_dir.",
+    )
+    parser.add_argument(
+        "--skip_eval",
+        action="store_true",
+        help="Compatibility flag: skip both private and plaintext evaluation.",
+    )
+    parser.add_argument(
+        "--shuffle_train",
+        action="store_true",
+        default=True,
+        help="Shuffle the training dataloader. Enabled by default for backward compatibility.",
+    )
+    parser.add_argument(
+        "--no_shuffle_train",
+        dest="shuffle_train",
+        action="store_false",
+        help="Disable training dataloader shuffling.",
     )
     parser.add_argument(
         "--quick_run",
@@ -1668,9 +1871,28 @@ def parse_args():
             "If empty, use all visible CUDA devices and map by rank."
         ),
     )
+    parser.add_argument("--world_size", type=int, default=2, help="Number of MPC parties/processes.")
     args = parser.parse_args()
 
     # Sanity checks
+    if args.eval_max_steps is None:
+        args.eval_max_steps = -1
+    if args.skip_eval:
+        args.skip_private_eval = True
+        args.skip_plain_eval = True
+    if args.private_loss_mode == "manual":
+        args.loss_type = "ce"
+    if args.softmax_ode_iter_source == "predictor":
+        logger.warning(
+            "--softmax_ode_iter_source predictor is accepted for config compatibility, "
+            "but this script does not run the predictor calibration path."
+        )
+    if args.trainable_scope != "lora" and not args.train_classifier_only:
+        logger.warning(
+            "--trainable_scope=%s is accepted for summary compatibility; this script still uses LoRA injection. "
+            "Use --train_classifier_only for classifier-only training.",
+            args.trainable_scope,
+        )
     if args.task_name is None and args.validation_file is None:
         raise ValueError("Need either a task name or a validation file.")
     else:
@@ -1685,6 +1907,7 @@ def main():
     script_start_time = time.time()
     args = parse_args()
     _configure_reuse_experiment(args)
+    _apply_private_math_config(args)
 
     if args.quick_run:
         args.pad_to_max_length = True
@@ -1742,7 +1965,15 @@ def main():
     logger.info("initial cfg snapshot=%s", _cfg_snapshot())
     logger.info("resolved seed=%s", args.seed)
     logger.info("resolved loss_type=%s", args.loss_type)
+    logger.info("resolved private_loss_mode=%s", args.private_loss_mode)
     logger.info("resolved ce_softmax_method=%s", args.ce_softmax_method)
+    logger.info(
+        "resolved optimizer=%s trainable_scope=%s shuffle_train=%s eval_every_steps=%s",
+        args.optimizer,
+        args.trainable_scope,
+        args.shuffle_train,
+        args.eval_every_steps,
+    )
     if args.loss_type == "ce" and args.ce_softmax_method == "reciprocal":
         logger.warning(
             "[ce] softmax_method=reciprocal can still be numerically fragile in MPC fixed-point; "
@@ -2005,7 +2236,7 @@ def main():
         train_dataset,
         collate_fn=data_collator,
         batch_size=args.per_device_train_batch_size,
-        shuffle=True,
+        shuffle=args.shuffle_train,
         generator=train_generator,
     )
 
@@ -2167,6 +2398,11 @@ def main():
         logger.info("[private-train-params] summary=%s", private_trainable_param_summary)
 
     private_model.train()
+    # CrypTen Module.train(True) can re-enable gradients on encrypted parameters.
+    # Re-apply the LoRA/classifier mask before collecting optimizer params.
+    private_trainable_param_summary = _apply_private_trainable_mask(private_model, trainable_names)
+    if rank == 0:
+        logger.info("[private-train-params-after-train] summary=%s", private_trainable_param_summary)
     optimizer, optimizer_summary = _build_private_optimizer(private_model, args)
     scheduler_summary = _configure_private_lr_schedule(optimizer, args, args.max_train_steps)
     logger.info(
@@ -2243,6 +2479,7 @@ def main():
         args.train_loss_window,
     )
     recent_train_losses = deque(maxlen=max(1, args.train_loss_window))
+    train_losses = []
     for _, batch in enumerate(train_dataloader):
         rank = _get_rank()
         logger.info(
@@ -2255,6 +2492,9 @@ def main():
         )
         if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
             continue
+
+        private_model.train()
+        _apply_private_trainable_mask(private_model, trainable_names)
 
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is None:
@@ -2282,6 +2522,7 @@ def main():
         inputs_enc = ct.cryptensor(batch["input_ids"]).to(device)
         attention_mask_enc = ct.cryptensor(batch["attention_mask"]).to(device)
         token_type_enc = ct.cryptensor(token_type_ids).to(device)
+        _step_private_lr_schedule(optimizer, args, global_step + 1, args.max_train_steps)
         optimizer.zero_grad()
         _synchronize_timing_device(device)
         prep_end = time.perf_counter()
@@ -2300,21 +2541,8 @@ def main():
             _shape_of(logits_enc),
         )
 
-        # For smoke tests we keep MSE available, but normal training should use CE.
-        num_labels = logits_enc.size(-1)
-        y_onehot = F.one_hot(batch["labels"], num_classes=num_labels).float()
-        y_enc = ct.cryptensor(y_onehot).to(device)
-        if args.loss_type == "ce":
-            if args.ce_softmax_method == "default":
-                loss_enc = logits_enc.cross_entropy(y_enc)
-            else:
-                with cfg.temp_override({"functions.softmax_method": args.ce_softmax_method}):
-                    loss_enc = logits_enc.cross_entropy(y_enc)
-        elif args.loss_type == "mse":
-            diff = logits_enc - y_enc
-            loss_enc = (diff * diff).mean()
-        else:
-            raise ValueError(f"Unsupported loss_type: {args.loss_type}")
+        # For smoke tests we keep MSE available, but aligned LoRA training uses manual private CE.
+        loss_enc, y_onehot = _compute_private_train_loss(logits_enc, batch["labels"], device, args)
 
         # optimizer (create once on first step)
         logger.info("[rank %s] train_step=%03d loss_snapshot=%s", rank, global_step, _loss_snapshot(loss_enc))
@@ -2367,7 +2595,6 @@ def main():
                 clear_current_reuse_step()
             logger.exception("[rank %s] train_step=%03d optimizer_step_failed", rank, global_step)
             raise
-        _step_private_lr_schedule(optimizer, args, global_step + 1, args.max_train_steps)
         _synchronize_timing_device(device)
         optimizer_end = time.perf_counter()
         logger.info("[rank %s] train_step=%03d optimizer_step_done", rank, global_step)
@@ -2504,6 +2731,7 @@ def main():
                     beaver_delta.get("residual_anchor_miss", 0),
                 )
         global_step += 1
+        train_losses.append(float(loss_plain))
         if global_step % max(1, args.log_every_steps) == 0:
             recent_train_losses.append(float(loss_plain))
             running_loss = sum(recent_train_losses) / len(recent_train_losses)
@@ -2549,6 +2777,7 @@ def main():
         private_metric = evaluate.load("glue", args.task_name) if args.task_name is not None else evaluate.load("accuracy")
         eval_steps = 0
         eval_skipped_by_len = 0
+        private_eval_loss_sum = 0.0
         for _, batch in enumerate(eval_dataloader):
             if args.len_data > 0 and batch["input_ids"].shape[1] != args.len_data:
                 eval_skipped_by_len += 1
@@ -2578,14 +2807,24 @@ def main():
                     clear_current_reuse_step()
 
             outputs = outputs_enc.get_plain_text().cpu()
-            predictions = outputs.argmax(dim=-1) if not is_regression else outputs.squeeze()
-            private_metric.add_batch(predictions=predictions, references=batch["labels"])
+            labels_cpu = batch["labels"].cpu()
+            if is_regression:
+                eval_loss = F.mse_loss(outputs.squeeze(), labels_cpu.float())
+                predictions = outputs.squeeze()
+            else:
+                eval_loss = F.cross_entropy(outputs, labels_cpu)
+                predictions = outputs.argmax(dim=-1)
+            private_eval_loss_sum += float(eval_loss.item())
+            private_metric.add_batch(predictions=predictions, references=labels_cpu)
             eval_steps += 1
 
             if args.eval_max_steps > 0 and eval_steps >= args.eval_max_steps:
                 break
 
         private_eval_metric = _safe_metric_compute(private_metric, eval_steps, rank, "eval-private")
+        private_eval_metric["eval_loss"] = private_eval_loss_sum / eval_steps if eval_steps > 0 else None
+        private_eval_metric["eval_steps"] = eval_steps
+        private_eval_metric["step"] = global_step
         if rank == 0:
             logger.info(
                 "[eval-private] steps=%s skipped_by_len=%s metric=%s",
@@ -2604,14 +2843,14 @@ def main():
     plain_steps = 0
     plain_skipped_by_len = 0
     plain_recovery_error = None
-    need_decrypt = (not args.skip_plain_eval) or (args.output_dir is not None)
+    need_decrypt = (not args.skip_plain_eval) or args.save_trained_model
     trained_model = None
     if need_decrypt:
         private_model.decrypt()
         # Keep decrypted CrypTen parameters on CPU so to_pytorch() can assign storage safely.
         private_model = private_model.to("cpu")
     _comm_barrier()
-    if rank == 0 and ((not args.skip_plain_eval) or (args.output_dir is not None)):
+    if rank == 0 and ((not args.skip_plain_eval) or args.save_trained_model):
         try:
             trained_model = _recover_plain_model_from_private(
                 private_model,
@@ -2675,23 +2914,37 @@ def main():
 
     if rank == 0 and args.output_dir is not None:
         trained_model_dir = os.path.join(args.output_dir, "trained_model")
-        if trained_model is not None:
+        if args.save_trained_model and trained_model is not None:
             os.makedirs(trained_model_dir, exist_ok=True)
             trained_model.save_pretrained(trained_model_dir)
             tokenizer.save_pretrained(trained_model_dir)
             logger.info("[save] trained model saved to %s", trained_model_dir)
-        else:
+        elif args.save_trained_model:
             logger.warning("[save] skip trained model export: plaintext model unavailable")
 
         total_elapsed_s = time.time() - script_start_time
+        final_learning_rate = None
+        if optimizer.param_groups:
+            final_learning_rate = optimizer.param_groups[0].get("lr")
         summary = {
             "train_steps": global_step,
             "private_eval_metric": private_eval_metric,
+            "best_private_eval": private_eval_metric if not private_eval_metric.get("skipped") else None,
+            "final_private_eval": private_eval_metric if not private_eval_metric.get("skipped") else None,
             "plain_eval_metric": plain_eval_metric,
+            "save_trained_model": args.save_trained_model,
             "adapter_type": args.adapter_type_label,
             "task_name": args.task_name,
+            "model_name_or_path": args.model_name_or_path,
             "max_train_steps": args.max_train_steps,
             "eval_max_steps": args.eval_max_steps,
+            "eval_every_steps": args.eval_every_steps,
+            "train_dataset_size": len(train_dataset),
+            "eval_dataset_size": len(eval_dataset),
+            "shuffle_train": args.shuffle_train,
+            "max_length": args.max_length,
+            "train_batch_size": args.per_device_train_batch_size,
+            "eval_batch_size": args.per_device_eval_batch_size,
             "crypten_native_lora": args.crypten_native_lora,
             "experimental_reuse_mask": args.experimental_reuse_mask,
             "reuse_mode": args.reuse_mode,
@@ -2703,8 +2956,52 @@ def main():
             "lora_b_post_export_restore_summary": lora_b_post_export_restore_summary,
             "public_non_lora_weights": args.public_non_lora_weights,
             "encrypted_param_keywords": args.encrypted_param_keywords,
+            "optimizer": args.optimizer,
             "learning_rate": args.learning_rate,
             "classifier_learning_rate": args.classifier_learning_rate,
+            "momentum": args.momentum,
+            "weight_decay": args.weight_decay,
+            "adam_beta1": args.adam_beta1,
+            "adam_beta2": args.adam_beta2,
+            "adam_epsilon": args.adam_epsilon,
+            "warmup_steps": _resolve_num_warmup_steps(args, args.max_train_steps),
+            "warmup_ratio": args.warmup_ratio,
+            "final_learning_rate": final_learning_rate,
+            "train_loss_min": min(train_losses) if train_losses else None,
+            "train_loss_max": max(train_losses) if train_losses else None,
+            "train_loss_last": train_losses[-1] if train_losses else None,
+            "train_loss_ma_last": _moving_average_last(train_losses, args.train_loss_window),
+            "train_loss_type": (
+                "manual_one_hot_cross_entropy"
+                if args.private_loss_mode == "manual"
+                else args.loss_type
+            ),
+            "private_loss_mode": args.private_loss_mode,
+            "loss_type": args.loss_type,
+            "ce_softmax_method": args.ce_softmax_method,
+            "ce_softmax_ode_lb": args.ce_softmax_ode_lb,
+            "softmax_method": getattr(cfg.functions, "softmax_method", None),
+            "softmax_ode_iter_num": getattr(cfg.functions, "softmax_ode_iter_num", None),
+            "softmax_ode_iter_source": args.softmax_ode_iter_source,
+            "softmax_ode_clip": getattr(cfg.functions, "softmax_ode_clip", None),
+            "softmax_ode_center_by_max": getattr(cfg.functions, "softmax_ode_center_by_max", None),
+            "softmax_ode_zero_masked": getattr(cfg.functions, "softmax_ode_zero_masked", None),
+            "softmax_ode_mask_margin": getattr(cfg.functions, "softmax_ode_mask_margin", None),
+            "sqrt_method": getattr(cfg.functions, "sqrt_method", None),
+            "sqrt_nr_iters": getattr(cfg.functions, "sqrt_nr_iters", None),
+            "sqrt_nr_initial_exp_iterations": getattr(cfg.functions, "sqrt_nr_initial_exp_iterations", None),
+            "sqrt_nr_linear_divisor": getattr(cfg.functions, "sqrt_nr_linear_divisor", None),
+            "trainable_scope": args.trainable_scope,
+            "full_finetune": args.trainable_scope == "full",
+            "lora_enabled": args.trainable_scope == "lora",
+            "lora_r": args.lora_r,
+            "lora_alpha": args.lora_alpha,
+            "lora_dropout": args.lora_dropout,
+            "lora_target_modules": args.lora_target_modules,
+            "freeze_classifier_head": args.freeze_classifier_head,
+            "lora_replaced_module_count": len(replaced_lora_modules),
+            "lora_replaced_modules": replaced_lora_modules,
+            "private_eval_during_training": not args.skip_private_eval,
             "optimizer_summary": optimizer_summary,
             "lr_scheduler_summary": scheduler_summary,
             "trainable_param_summary": trainable_param_summary,
@@ -2716,6 +3013,10 @@ def main():
         summary_path = os.path.join(args.output_dir, "train_eval_summary.json")
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
+        compat_summary_path = os.path.join(args.output_dir, "summary.json")
+        with open(compat_summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        logger.info("[summary] %s", summary)
         logger.info("[save] summary saved to %s", summary_path)
 
     if rank == 0:
@@ -2737,7 +3038,7 @@ if __name__ == "__main__":
         # run with communication
         with cfg.temp_override({"cost.estimate_cost": args.print_comm_cost, "cost.estimate_mode": "comm"}):
 
-            launcher = MultiProcessLauncher(2, main)
+            launcher = MultiProcessLauncher(args.world_size, main)
             launcher.start()
             launcher.join()
             launcher.terminate()

@@ -1,0 +1,195 @@
+
+--- PAGE 1 ---
+CrypTen 中LoRA-MPC 训练与性能优化报告
+第三周工作汇报
+1 本周主要内容
+1. 将LoRA 接入CrypTen 的MPC 训练，并保持正确性
+2. 尝试调优，减少开销
+• LoRA 已通过MPCLoRALinear + AutogradLoRALinear 在mpc 中正确实现，模型性能与明文
+侧lora 相当。
+• 配置各算子迭代轮次，保持正确性的前提下，减少14% 总时长
+2 将LoRA 集成到CrypTen MPC 大模型训练
+2.1 目标
+• 代码正常运行
+• 正确性相对plain-lora 不回退
+2.2 当前实现
+• LoRA module 定义；
+图1: LoRA module 定义
+1
+
+--- PAGE 2 ---
+• LoRA Op 定义；
+图2: op-forward 定义
+图3: op-backward 定义
+• Grouped Shared MatMul 实现
+2
+
+--- PAGE 3 ---
+图4: 接口
+图5: 实现
+3
+
+--- PAGE 4 ---
+图6: beaver tiple 复用生成
+2.3 结果验证
+图7: mpc-lora
+图8: plain-lora
+4
+
+--- PAGE 5 ---
+表1: LoRA private/plain 对比
+配置
+last loss
+eval loss
+acc
+plain lora
+0.55
+0.54
+0.73
+private lora
+0.45
+0.49
+0.76
+3 调优尝试
+3.1 目标
+• 保持当前训练质量
+• 降低单步训练时长
+3.2 LoRA backward 侧优化：ctx 修正
+前向
+y = xW ⊤+ (xA⊤)B⊤· s + b,
+h = xA⊤,
+中的中间量h = xA⊤在反向中也需要计算
+∂L
+∂B =
+(∂L
+∂y
+)⊤
+h · s
+因此需要将xA⊤放入ctx。
+图9: ctx-f
+图10: ctx-b
+表2: ctx 修正前后对比
+配置
+10-step 总耗时
+50-step 总耗时
+11–50 warmed-up 单步
+1
+84.66s
+418.24s
+8.3395s
+2
+81.21s
+398.33s
+约快4.93%
+5
+
+--- PAGE 6 ---
+3.3 softmax / invsqrt 开销优化
+• LoRA backward 边际收益较小
+• softmax 和invsqrt 的nr_iters 压缩空间很小
+新增了独立开关：
+sqrt_nr_initial_exp_iterations
+它只影响invsqrt 初值中的exp 函数中的迭代次数
+图11: exp-iter
+短程50step 下扫描：
+• initexp5
+• initexp6
+• initexp7
+• initexp8(default)
+• softmax16(default)
+• softmax15
+• softmax14
+• softmax13
+• invsqrt10
+• invsqrt9
+• invsqrt8
+• invsqrt7
+最终选中（保守地）：initexp7/softmax15/invsqrt10
+6
+
+--- PAGE 7 ---
+3.4 长程验证
+表3: baseline 与iter7/15/10 的长程对比
+配置
+final accuracy
+final eval loss
+elapsed time
+plain
+0.73
+/
+/
+lora-baseline
+0.7615
+0.4845063
+7575.69s
+iter7/15/10
+0.7661
+0.4846269
+6529.98s
+• acc 提升约0.46 个百分点
+• eval loss 基本持平
+• 总耗时减少约1045.7s，缩短约13.8%
+4 长程对照试验的共享训练设置
+• task: SST-2
+• model: prajjwal1/bert-tiny
+• train steps: 1250
+• train / eval size: 10000 / 872
+• shuffle: False
+• train / eval batch size: 8 / 8
+• optimizer: SGD
+• lr: 3 × 10−3
+• momentum: 0.9
+• weight decay: 0
+• warmup steps / ratio: 75 / 0.06
+• loss: manual one-hot cross-entropy
+• private loss mode: manual
+• trainable scope: LoRA
+• LoRA: r = 8, α = 16, dropout = 0
+• target modules: query, value
+• replaced modules: 4
+• layers:
+{layer0.query, layer0.value, layer1.query, layer1.value}
+7
+
+--- PAGE 8 ---
+5 LoRA-MPC 训练阶段相关记录文件地址
+公共前缀examples/text-classification/。包含sst2/{summary.json, train_history.json,
+eval_history.json, training_curves.png}。
+5.1 初始LoRA-MPC 训练与Probe
+• eval_private_control_bert_tiny_lora_sgd_qv_step10_noeval_probe
+• eval_private_control_bert_tiny_lora_sgd_t10000_step1_ode_ceideal_nr10div1536_qv_noeval_pr
+• eval_private_control_bert_tiny_lora_sgd_t10000_step10_ode_ceideal_nr10div1536_qv_noeval_p
+5.2 Softmax / InvSqrt 主迭代组合扫描
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_nr10div1536_qv_noeval
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode14_ceideal_nr10div1536_qv_noeval
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode15_ceideal_nr10div1536_qv_noeval
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_nr9div1536_qv_noeval_
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode16_nr10_reusehidden
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode14_nr10_reusehidden
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode15_nr10_reusehidden
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode16_nr9_reusehidden
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode14_nr9_reusehidden
+5.3 Single-Ideal 对照与1250 Step Ideal 对照
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ideal_ceideal_nr10div1536_qv_noeval
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_ideal_qv_noeval_probe
+• eval_private_control_bert_tiny_lora_sgd_t10000_e872_step1250_ideal_qv
+5.4 InitExp 局部Exp 迭代扫描
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_nr10div1536_qv_noeval
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_nr10_initexp5_div1536
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_nr10_initexp6_div1536
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_nr10_initexp6_div1536
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_nr10_initexp7_div1536
+• eval_private_control_bert_tiny_lora_sgd_t10000_step50_ode16_ceideal_nr10_initexp7_div1536
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode16_nr10_reusehidden
+8
+
+--- PAGE 9 ---
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode16_nr10_initexp5_reusehidden
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode16_nr10_initexp6_reusehidden
+• eval_private_control_bert_tiny_lora_sgd_tiny8_step4_ode16_nr10_initexp7_reusehidden
+• eval_private_control_bert_tiny_lora_sgd_t10000_e872_step1250_ode_ceideal_nr10div1536_qv
+• eval_private_control_bert_tiny_lora_sgd_t10000_e872_step1250_ode_ceideal_nr10_initexp7_di
+5.5 Plain LoRA 对照记录
+• eval_plain_control_bert_tiny_lora_sgd_t10000_e872_step1500_shuffle_lr3e3_r8_qv
+• eval_plain_control_bert_tiny_lora_sgd_t10000_e872_step1500_shuffle_lr3e3_r8_qv_eval100_re
+9
